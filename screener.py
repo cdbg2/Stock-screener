@@ -18,8 +18,11 @@ Usage:
 """
 
 import argparse
+import csv
+import io
 import sys
 import time
+import urllib.request
 
 import pandas as pd
 import yfinance as yf
@@ -40,6 +43,53 @@ DEFAULT_TICKERS = [
     "AVGO", "COST", "WMT", "XOM", "CVX", "LLY", "MCD", "TXN", "NEE", "LOW",
     "UPS", "CAT", "DE", "MMM", "GS", "AXP", "BLK", "SCHW", "CL", "GIS",
 ]
+
+
+def fetch_us_tickers():
+    """Fetch all common-stock tickers listed on NYSE, NASDAQ, and AMEX.
+
+    Uses the official NASDAQ Trader daily file which lists every security
+    traded on the NASDAQ system (including NYSE and AMEX via UTP).
+    Filters out ETFs, preferred shares, warrants, units, and test symbols.
+    """
+    url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"
+    print("  Fetching all US-traded tickers from NASDAQ...")
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8")
+
+    tickers = []
+    lines = raw.strip().split("\n")
+    # Header is first line, last line is a timestamp/footer
+    header = lines[0].split("|")
+    col = {name: i for i, name in enumerate(header)}
+
+    for line in lines[1:]:
+        fields = line.split("|")
+        if len(fields) < len(header):
+            continue
+
+        symbol = fields[col.get("Symbol", col.get("NASDAQ Symbol", 0))].strip()
+        etf = fields[col.get("ETF", -1)].strip() if "ETF" in col else "N"
+        test = fields[col.get("Test Issue", -1)].strip() if "Test Issue" in col else "N"
+
+        # Skip ETFs and test issues
+        if etf == "Y" or test == "Y":
+            continue
+
+        # Skip symbols with special characters (preferred shares, warrants, units)
+        if not symbol or any(c in symbol for c in [".", "$", " ", "/"]):
+            continue
+
+        # Skip very long symbols (usually warrants/units like ABCDW)
+        if len(symbol) > 5:
+            continue
+
+        tickers.append(symbol)
+
+    print(f"  Found {len(tickers)} common-stock tickers.\n")
+    return sorted(set(tickers))
 
 
 def get_eps_history(ticker_obj):
@@ -305,6 +355,14 @@ def main():
         "--csv", metavar="PATH",
         help="Export results to CSV file"
     )
+    parser.add_argument(
+        "--all-us", action="store_true",
+        help="Screen ALL U.S. publicly traded stocks (fetches tickers dynamically)"
+    )
+    parser.add_argument(
+        "--pass-only", action="store_true",
+        help="Only include passing stocks (score 4/4) in output and CSV"
+    )
     args = parser.parse_args()
 
     MIN_NET_INCOME = args.min_income
@@ -312,7 +370,9 @@ def main():
     MIN_INTEREST_COVERAGE = args.min_interest_coverage
 
     # Determine ticker list
-    if args.tickers:
+    if args.all_us:
+        tickers = fetch_us_tickers()
+    elif args.tickers:
         tickers = [t.upper() for t in args.tickers]
     elif args.file:
         tickers = load_tickers_from_file(args.file)
@@ -321,7 +381,15 @@ def main():
 
     print(f"\n  Buffett Stock Screener — screening {len(tickers)} stocks...\n")
     df = run_screener(tickers)
-    print_results(df)
+
+    if args.pass_only:
+        df = df[df["_score"] == 4]
+        if df.empty:
+            print("\n  No stocks passed all 4 criteria.\n")
+        else:
+            print_results(df)
+    else:
+        print_results(df)
 
     if args.csv:
         export = df[[c for c in df.columns if c != "_score"]]
