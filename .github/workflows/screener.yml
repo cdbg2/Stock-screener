@@ -6,6 +6,9 @@ on:
     - cron: "0 18 * * 1-5"
   workflow_dispatch: # Allow manual trigger from GitHub
 
+permissions:
+  contents: write
+
 jobs:
   screen:
     runs-on: ubuntu-latest
