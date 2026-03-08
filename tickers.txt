@@ -1,0 +1,12 @@
+# Add one ticker symbol per line
+# Lines starting with # are ignored
+AAPL
+MSFT
+GOOGL
+BRK-B
+JNJ
+KO
+PG
+JPM
+V
+WMT
