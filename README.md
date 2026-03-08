@@ -47,3 +47,7 @@ Stocks are scored 0-4 based on the quantitative criteria and sorted by score. Re
 - **FAIL** — No criteria met
 
 Insider ownership % is displayed for manual review of the "Committed Managers" criterion. The "Simple Business Model" criterion requires your own research into the company.
+
+## Automated Runs
+
+A GitHub Actions workflow runs the screener every weekday at 6 PM UTC (after US market close) and commits `results.csv` to this repo. You can also trigger it manually from the **Actions** tab.
