@@ -204,14 +204,20 @@ def get_business_segments(ticker_obj):
     return None
 
 
-def screen_ticker(symbol):
-    """Screen a single ticker. Returns a dict of results."""
+def screen_ticker(symbol, quick_reject=False):
+    """Screen a single ticker. Returns a dict of results, or None if quick-rejected."""
     try:
         t = yf.Ticker(symbol)
         info = t.info
         name = info.get("shortName", info.get("longName", symbol))
 
+        # ── Quick reject: check net income first (cheapest filter) ─────
         net_income = get_net_income(t)
+        pass_income = net_income is not None and net_income >= MIN_NET_INCOME
+
+        if quick_reject and not pass_income:
+            return None  # skip expensive checks for stocks that can't pass
+
         eps_list = get_eps_history(t)
         consistent_eps = check_consistent_eps_growth(eps_list)
         roe = get_roe(t)
@@ -219,7 +225,6 @@ def screen_ticker(symbol):
         insider_pct = get_insider_ownership(t)
 
         # ── Apply pass/fail for each criterion ───────────────────────────
-        pass_income = net_income is not None and net_income >= MIN_NET_INCOME
         pass_eps = consistent_eps is True
         pass_roe = roe is not None and roe >= MIN_ROE
         pass_int_cov = interest_cov is not None and interest_cov > MIN_INTEREST_COVERAGE
@@ -240,7 +245,9 @@ def screen_ticker(symbol):
             "Score": f"{total_pass}/4",
             "_score": total_pass,
         }
-    except Exception as e:
+    except Exception:
+        if quick_reject:
+            return None
         return {
             "Ticker": symbol,
             "Company": "ERROR",
@@ -257,16 +264,23 @@ def screen_ticker(symbol):
         }
 
 
-def run_screener(tickers):
+def run_screener(tickers, quick_reject=False):
     """Screen all tickers and return a sorted DataFrame."""
     results = []
+    skipped = 0
     total = len(tickers)
     for i, symbol in enumerate(tickers, 1):
-        print(f"  [{i}/{total}] Screening {symbol}...", end="\r")
-        results.append(screen_ticker(symbol))
-        time.sleep(0.2)  # be nice to the API
+        print(f"  [{i}/{total}] Screening {symbol} (skipped {skipped})...", end="\r")
+        result = screen_ticker(symbol, quick_reject=quick_reject)
+        if result is None:
+            skipped += 1
+        else:
+            results.append(result)
+        time.sleep(0.05)  # brief pause to avoid rate limits
 
-    print(" " * 60, end="\r")  # clear progress line
+    print(" " * 80, end="\r")  # clear progress line
+    if quick_reject:
+        print(f"  Quick-reject filtered out {skipped}/{total} stocks early.\n")
     df = pd.DataFrame(results)
     df = df.sort_values("_score", ascending=False)
     return df
@@ -380,7 +394,7 @@ def main():
         tickers = DEFAULT_TICKERS
 
     print(f"\n  Buffett Stock Screener — screening {len(tickers)} stocks...\n")
-    df = run_screener(tickers)
+    df = run_screener(tickers, quick_reject=args.all_us)
 
     if args.pass_only:
         df = df[df["_score"] == 4]
