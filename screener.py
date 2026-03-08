@@ -276,6 +276,8 @@ def load_tickers_from_file(filepath):
 
 
 def main():
+    global MIN_NET_INCOME, MIN_ROE, MIN_INTEREST_COVERAGE
+
     parser = argparse.ArgumentParser(
         description="Buffett-Style Stock Screener — screen stocks using Warren Buffett's criteria"
     )
@@ -305,8 +307,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Override thresholds if provided
-    global MIN_NET_INCOME, MIN_ROE, MIN_INTEREST_COVERAGE
     MIN_NET_INCOME = args.min_income
     MIN_ROE = args.min_roe
     MIN_INTEREST_COVERAGE = args.min_interest_coverage
