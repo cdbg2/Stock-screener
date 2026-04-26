@@ -20,8 +20,10 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run screener
-        run: python screener.py --all-us --pass-only --csv results.csv
-        timeout-minutes: 120
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python screener.py --pass-only --csv results.csv
+        timeout-minutes: 10
 
       - name: Upload results
         uses: actions/upload-artifact@v4

@@ -2,306 +2,239 @@
 """
 Buffett-Style Stock Screener
 =============================
-Screens stocks based on Warren Buffett's investment criteria:
+Screens U.S. mid-to-large cap stocks using Warren Buffett's criteria:
 
 1. Cash Available      - Net income >= $75 million
 2. Consistent Growth   - Positive EPS growth each of the past 5 years
 3. Good ROI            - Return on Equity > 10%
 4. Low Debt            - Interest coverage ratio > 1
 5. Committed Managers  - Insider ownership % (flagged for review)
-6. Simple Business     - Number of business segments (flagged for review)
+6. Simple Business     - Manual review required
+
+Uses the Financial Modeling Prep (FMP) API for fast data retrieval.
 
 Usage:
-    python screener.py                        # screen default S&P 500 tickers
-    python screener.py --tickers AAPL MSFT    # screen specific tickers
-    python screener.py --file tickers.txt     # screen tickers from file
+    python screener.py                             # screen all US mid-to-large cap
+    python screener.py --api-key YOUR_KEY          # provide API key directly
+    python screener.py --pass-only --csv out.csv   # export only full-pass stocks
 """
 
 import argparse
-import csv
-import io
+import os
 import sys
 import time
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import yfinance as yf
+import requests
 from tabulate import tabulate
 
 
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
 # ── Buffett criteria thresholds (edit these to taste) ────────────────────────
-MIN_NET_INCOME = 75_000_000       # $75 million minimum net income
-MIN_ROE = 0.10                    # 10% return on equity
-MIN_INTEREST_COVERAGE = 1.0       # interest coverage ratio > 1
-EPS_GROWTH_YEARS = 5              # positive EPS each of the past 5 years
+MIN_NET_INCOME = 75_000_000
+MIN_ROE = 0.10
+MIN_INTEREST_COVERAGE = 1.0
+EPS_GROWTH_YEARS = 5
+MIN_MARKET_CAP = 2_000_000_000  # pre-filter for API efficiency
 
 
-# ── Default tickers (a representative set of large-cap US stocks) ────────────
-DEFAULT_TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "BRK-B", "JNJ", "JPM", "V", "PG", "UNH",
-    "HD", "MA", "DIS", "NVDA", "KO", "PEP", "PFE", "MRK", "ABT", "CSCO",
-    "AVGO", "COST", "WMT", "XOM", "CVX", "LLY", "MCD", "TXN", "NEE", "LOW",
-    "UPS", "CAT", "DE", "MMM", "GS", "AXP", "BLK", "SCHW", "CL", "GIS",
-]
+def fmp_get(endpoint, api_key, params=None):
+    url = f"{FMP_BASE}/{endpoint}"
+    p = {"apikey": api_key}
+    if params:
+        p.update(params)
+    resp = requests.get(url, params=p, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def fetch_us_tickers():
-    """Fetch all common-stock tickers listed on NYSE, NASDAQ, and AMEX.
-
-    Uses the official NASDAQ Trader daily file which lists every security
-    traded on the NASDAQ system (including NYSE and AMEX via UTP).
-    Filters out ETFs, preferred shares, warrants, units, and test symbols.
-    """
-    url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"
-    print("  Fetching all US-traded tickers from NASDAQ...")
-
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8")
-
-    tickers = []
-    lines = raw.strip().split("\n")
-    # Header is first line, last line is a timestamp/footer
-    header = lines[0].split("|")
-    col = {name: i for i, name in enumerate(header)}
-
-    for line in lines[1:]:
-        fields = line.split("|")
-        if len(fields) < len(header):
-            continue
-
-        symbol = fields[col.get("Symbol", col.get("NASDAQ Symbol", 0))].strip()
-        etf = fields[col.get("ETF", -1)].strip() if "ETF" in col else "N"
-        test = fields[col.get("Test Issue", -1)].strip() if "Test Issue" in col else "N"
-
-        # Skip ETFs and test issues
-        if etf == "Y" or test == "Y":
-            continue
-
-        # Skip symbols with special characters (preferred shares, warrants, units)
-        if not symbol or any(c in symbol for c in [".", "$", " ", "/"]):
-            continue
-
-        # Skip very long symbols (usually warrants/units like ABCDW)
-        if len(symbol) > 5:
-            continue
-
-        tickers.append(symbol)
-
-    print(f"  Found {len(tickers)} common-stock tickers.\n")
-    return sorted(set(tickers))
+def fetch_candidates(api_key):
+    data = fmp_get("stock-screener", api_key, {
+        "marketCapMoreThan": MIN_MARKET_CAP,
+        "isActivelyTrading": "true",
+        "country": "US",
+        "exchange": "NYSE,NASDAQ,AMEX",
+        "limit": 5000,
+    })
+    data.sort(key=lambda x: x.get("marketCap", 0), reverse=True)
+    return data
 
 
-def get_eps_history(ticker_obj):
-    """Return a list of annual EPS values (oldest to newest)."""
-    financials = ticker_obj.financials  # annual income statement
-    if financials is None or financials.empty:
-        return []
-
-    # "Basic EPS" or "Diluted EPS" row
-    for label in ["Basic EPS", "Diluted EPS"]:
-        if label in financials.index:
-            eps_series = financials.loc[label].dropna().sort_index()
-            return eps_series.tolist()
-
-    # Fallback: compute from Net Income / Shares Outstanding
-    earnings = ticker_obj.earnings_history if hasattr(ticker_obj, "earnings_history") else None
-    if earnings is not None and not earnings.empty:
-        return earnings["epsActual"].dropna().tolist()
-
-    return []
+def fetch_income_statements(symbol, api_key):
+    return fmp_get(f"income-statement/{symbol}", api_key, {"limit": 5, "period": "annual"})
 
 
-def check_consistent_eps_growth(eps_list, years=EPS_GROWTH_YEARS):
-    """Return True if EPS increased every year for the past `years` years."""
-    if len(eps_list) < years:
-        return None  # not enough data
-    recent = eps_list[-years:]
-    for i in range(1, len(recent)):
-        if recent[i] <= recent[i - 1]:
-            return False
-    return True
+def fetch_balance_sheet(symbol, api_key):
+    data = fmp_get(f"balance-sheet-statement/{symbol}", api_key, {"limit": 1, "period": "annual"})
+    return data[0] if data else {}
 
 
-def get_net_income(ticker_obj):
-    """Return the most recent annual net income in dollars."""
-    financials = ticker_obj.financials
-    if financials is None or financials.empty:
-        return None
-    for label in ["Net Income", "Net Income Common Stockholders"]:
-        if label in financials.index:
-            values = financials.loc[label].dropna().sort_index()
-            if not values.empty:
-                return values.iloc[-1]
+def check_income_criteria(statements):
+    if not statements:
+        return None, [], None, None
+
+    sorted_stmts = sorted(statements, key=lambda x: x.get("date", ""))
+
+    net_income = sorted_stmts[-1].get("netIncome")
+
+    eps_list = []
+    for s in sorted_stmts:
+        eps = s.get("epsdiluted") or s.get("eps")
+        if eps is not None:
+            eps_list.append(eps)
+
+    eps_growing = None
+    if len(eps_list) >= EPS_GROWTH_YEARS:
+        recent = eps_list[-EPS_GROWTH_YEARS:]
+        eps_growing = all(recent[i] > recent[i - 1] for i in range(1, len(recent)))
+
+    latest = sorted_stmts[-1]
+    op_income = latest.get("operatingIncome") or 0
+    int_expense = abs(latest.get("interestExpense") or 0)
+    if int_expense > 0:
+        interest_cov = op_income / int_expense
+    elif op_income > 0:
+        interest_cov = float("inf")
+    else:
+        interest_cov = None
+
+    return net_income, eps_list, eps_growing, interest_cov
+
+
+def compute_roe(net_income, balance_sheet):
+    equity = balance_sheet.get("totalStockholdersEquity")
+    if equity and equity != 0 and net_income is not None:
+        return net_income / equity
     return None
 
 
-def get_roe(ticker_obj):
-    """Return the most recent Return on Equity."""
-    info = ticker_obj.info
-    roe = info.get("returnOnEquity")
-    if roe is not None:
-        return roe
+def run_screener(api_key, max_candidates=200):
+    t0 = time.time()
 
-    # Fallback: Net Income / Total Stockholder Equity
-    try:
-        net_income = get_net_income(ticker_obj)
-        bs = ticker_obj.balance_sheet
-        if bs is not None and not bs.empty:
-            for label in ["Stockholders Equity", "Total Stockholder Equity",
-                          "Stockholders' Equity"]:
-                if label in bs.index:
-                    equity = bs.loc[label].dropna().sort_index().iloc[-1]
-                    if equity and equity != 0:
-                        return net_income / equity
-    except Exception:
-        pass
-    return None
+    # ── Phase 1: Get candidates from FMP screener (1 API call) ───────────
+    print("  Phase 1: Fetching US stock candidates...")
+    candidates = fetch_candidates(api_key)
+    if not candidates:
+        print("  ERROR: No candidates returned. Check your API key.\n")
+        return pd.DataFrame()
 
+    candidates = candidates[:max_candidates]
+    api_calls = 1
+    print(f"           {len(candidates)} stocks with marketCap > ${MIN_MARKET_CAP / 1e9:.0f}B\n")
 
-def get_interest_coverage(ticker_obj):
-    """Return Interest Coverage Ratio = EBIT / Interest Expense."""
-    financials = ticker_obj.financials
-    if financials is None or financials.empty:
-        return None
+    # ── Phase 2: Income statements — check 3 of 4 criteria (N calls) ────
+    print("  Phase 2: Checking income, EPS growth & interest coverage...")
+    phase2_pass = []
+    done = 0
 
-    ebit = None
-    for label in ["EBIT", "Operating Income"]:
-        if label in financials.index:
-            vals = financials.loc[label].dropna().sort_index()
-            if not vals.empty:
-                ebit = vals.iloc[-1]
-                break
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {}
+        for c in candidates:
+            f = executor.submit(fetch_income_statements, c["symbol"], api_key)
+            futures[f] = c
 
-    interest = None
-    for label in ["Interest Expense", "Interest Expense Non Operating"]:
-        if label in financials.index:
-            vals = financials.loc[label].dropna().sort_index()
-            if not vals.empty:
-                interest = abs(vals.iloc[-1])
-                break
+        for f in as_completed(futures):
+            done += 1
+            c = futures[f]
+            print(f"           [{done}/{len(candidates)}] {c['symbol']}", end="\r")
+            try:
+                statements = f.result()
+                api_calls += 1
+                net_income, eps_list, eps_growing, int_cov = check_income_criteria(statements)
 
-    if ebit is not None and interest and interest != 0:
-        return ebit / interest
-    if ebit is not None and (interest is None or interest == 0):
-        return float("inf")  # no debt → passes easily
-    return None
+                pass_income = net_income is not None and net_income >= MIN_NET_INCOME
+                if not pass_income:
+                    continue
 
+                phase2_pass.append({
+                    "symbol": c["symbol"],
+                    "name": (c.get("companyName") or c["symbol"])[:30],
+                    "net_income": net_income,
+                    "eps_list": eps_list,
+                    "eps_growing": eps_growing,
+                    "int_cov": int_cov,
+                    "pass_income": True,
+                    "pass_eps": eps_growing is True,
+                    "pass_int_cov": int_cov is not None and int_cov > MIN_INTEREST_COVERAGE,
+                })
+            except Exception:
+                api_calls += 1
 
-def get_insider_ownership(ticker_obj):
-    """Return insider holding percentage (0-100), or None."""
-    info = ticker_obj.info
-    pct = info.get("heldPercentInsiders")
-    if pct is not None:
-        return pct * 100
-    return None
+    print(f"           {len(phase2_pass)} stocks pass ${MIN_NET_INCOME / 1e6:.0f}M income threshold{' ' * 20}\n")
 
+    if not phase2_pass:
+        return pd.DataFrame()
 
-def get_business_segments(ticker_obj):
-    """Return count of business segments if available, else None."""
-    # yfinance doesn't provide segment data directly; use sector as a proxy
-    # and flag for manual review.
-    return None
+    # ── Phase 3: Balance sheets — ROE check for survivors only (M calls) ─
+    print(f"  Phase 3: Checking ROE for {len(phase2_pass)} candidates...")
+    done = 0
 
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {}
+        for r in phase2_pass:
+            f = executor.submit(fetch_balance_sheet, r["symbol"], api_key)
+            futures[f] = r
 
-def screen_ticker(symbol, quick_reject=False):
-    """Screen a single ticker. Returns a dict of results, or None if quick-rejected."""
-    try:
-        t = yf.Ticker(symbol)
-        info = t.info
-        name = info.get("shortName", info.get("longName", symbol))
+        for f in as_completed(futures):
+            done += 1
+            r = futures[f]
+            print(f"           [{done}/{len(phase2_pass)}] {r['symbol']}", end="\r")
+            try:
+                bs = f.result()
+                api_calls += 1
+                roe = compute_roe(r["net_income"], bs)
+                r["roe"] = roe
+                r["pass_roe"] = roe is not None and roe >= MIN_ROE
+            except Exception:
+                api_calls += 1
+                r["roe"] = None
+                r["pass_roe"] = False
 
-        # ── Quick reject: check net income first (cheapest filter) ─────
-        net_income = get_net_income(t)
-        pass_income = net_income is not None and net_income >= MIN_NET_INCOME
+    elapsed = time.time() - t0
+    print(f"           Done. ({api_calls} API calls, {elapsed:.1f}s){' ' * 20}\n")
 
-        if quick_reject and not pass_income:
-            return None  # skip expensive checks for stocks that can't pass
-
-        eps_list = get_eps_history(t)
-        consistent_eps = check_consistent_eps_growth(eps_list)
-        roe = get_roe(t)
-        interest_cov = get_interest_coverage(t)
-        insider_pct = get_insider_ownership(t)
-
-        # ── Apply pass/fail for each criterion ───────────────────────────
-        pass_eps = consistent_eps is True
-        pass_roe = roe is not None and roe >= MIN_ROE
-        pass_int_cov = interest_cov is not None and interest_cov > MIN_INTEREST_COVERAGE
-
-        total_pass = sum([pass_income, pass_eps, pass_roe, pass_int_cov])
-
-        return {
-            "Ticker": symbol,
-            "Company": name[:30],
-            "Net Income ($M)": f"{net_income / 1e6:,.0f}" if net_income else "N/A",
-            "Income ≥$75M": "PASS" if pass_income else "FAIL",
-            "EPS 5yr Growth": "PASS" if pass_eps else ("N/A" if consistent_eps is None else "FAIL"),
+    # ── Build results DataFrame ──────────────────────────────────────────
+    rows = []
+    for r in phase2_pass:
+        score = sum([r["pass_income"], r["pass_eps"], r.get("pass_roe", False), r["pass_int_cov"]])
+        int_cov = r["int_cov"]
+        roe = r.get("roe")
+        rows.append({
+            "Ticker": r["symbol"],
+            "Company": r["name"],
+            "Net Income ($M)": f"{r['net_income'] / 1e6:,.0f}",
+            "Income ≥$75M": "PASS",
+            "EPS 5yr Growth": "PASS" if r["pass_eps"] else ("N/A" if r["eps_growing"] is None else "FAIL"),
             "ROE (%)": f"{roe * 100:.1f}" if roe else "N/A",
-            "ROE >10%": "PASS" if pass_roe else "FAIL",
-            "Int. Coverage": f"{interest_cov:.1f}" if interest_cov and interest_cov != float("inf") else ("No Debt" if interest_cov == float("inf") else "N/A"),
-            "Int.Cov >1": "PASS" if pass_int_cov else "FAIL",
-            "Insider %": f"{insider_pct:.1f}" if insider_pct else "N/A",
-            "Score": f"{total_pass}/4",
-            "_score": total_pass,
-        }
-    except Exception:
-        if quick_reject:
-            return None
-        return {
-            "Ticker": symbol,
-            "Company": "ERROR",
-            "Net Income ($M)": "N/A",
-            "Income ≥$75M": "ERR",
-            "EPS 5yr Growth": "ERR",
-            "ROE (%)": "N/A",
-            "ROE >10%": "ERR",
-            "Int. Coverage": "N/A",
-            "Int.Cov >1": "ERR",
-            "Insider %": "N/A",
-            "Score": "0/4",
-            "_score": 0,
-        }
+            "ROE >10%": "PASS" if r.get("pass_roe") else "FAIL",
+            "Int. Coverage": (
+                f"{int_cov:.1f}" if int_cov and int_cov != float("inf")
+                else ("No Debt" if int_cov == float("inf") else "N/A")
+            ),
+            "Int.Cov >1": "PASS" if r["pass_int_cov"] else "FAIL",
+            "Score": f"{score}/4",
+            "_score": score,
+        })
 
-
-def run_screener(tickers, quick_reject=False):
-    """Screen all tickers and return a sorted DataFrame."""
-    results = []
-    skipped = 0
-    total = len(tickers)
-    for i, symbol in enumerate(tickers, 1):
-        print(f"  [{i}/{total}] Screening {symbol} (skipped {skipped})...", end="\r")
-        result = screen_ticker(symbol, quick_reject=quick_reject)
-        if result is None:
-            skipped += 1
-        else:
-            results.append(result)
-        time.sleep(0.05)  # brief pause to avoid rate limits
-
-    print(" " * 80, end="\r")  # clear progress line
-    if quick_reject:
-        print(f"  Quick-reject filtered out {skipped}/{total} stocks early.\n")
-    df = pd.DataFrame(results)
-    df = df.sort_values("_score", ascending=False)
-    return df
+    df = pd.DataFrame(rows)
+    return df.sort_values("_score", ascending=False)
 
 
 def print_results(df):
-    """Pretty-print the screening results."""
-    # Separate into passing (all 4) and partial
     display_cols = [c for c in df.columns if c != "_score"]
     passing = df[df["_score"] == 4]
     partial = df[(df["_score"] > 0) & (df["_score"] < 4)]
-    failing = df[df["_score"] == 0]
 
     print("\n" + "=" * 80)
     print("  BUFFETT-STYLE STOCK SCREENER RESULTS")
     print("=" * 80)
 
-    print(f"\n  Criteria: Net Income ≥ ${MIN_NET_INCOME/1e6:.0f}M | "
-          f"EPS growth 5yr | ROE > {MIN_ROE*100:.0f}% | "
+    print(f"\n  Criteria: Net Income ≥ ${MIN_NET_INCOME / 1e6:.0f}M | "
+          f"EPS growth {EPS_GROWTH_YEARS}yr | ROE > {MIN_ROE * 100:.0f}% | "
           f"Interest Coverage > {MIN_INTEREST_COVERAGE}")
-    print(f"  Stocks screened: {len(df)}")
+    print(f"  Stocks passing income threshold: {len(df)}")
 
     if not passing.empty:
         print(f"\n{'─' * 80}")
@@ -309,8 +242,8 @@ def print_results(df):
         print(f"{'─' * 80}")
         print(tabulate(passing[display_cols], headers="keys", tablefmt="simple",
                         showindex=False))
-        print("\n  → Review these for Insider Ownership (committed managers)")
-        print("    and business simplicity before investing.")
+        print("\n  → Review these for committed management and business simplicity")
+        print("    before investing.")
 
     if not partial.empty:
         print(f"\n{'─' * 80}")
@@ -319,39 +252,21 @@ def print_results(df):
         print(tabulate(partial[display_cols], headers="keys", tablefmt="simple",
                         showindex=False))
 
-    if not failing.empty:
-        print(f"\n{'─' * 80}")
-        print(f"  FAIL — No criteria met ({len(failing)} stocks)")
-        print(f"{'─' * 80}")
-        tickers_str = ", ".join(failing["Ticker"].tolist())
-        print(f"  {tickers_str}")
-
     print(f"\n{'=' * 80}")
     print("  NOTE: 'Committed Managers' and 'Simple Business Model' require")
-    print("  qualitative judgment. Check insider ownership % and research the")
-    print("  company's business segments before making investment decisions.")
+    print("  qualitative judgment. Research the company before investing.")
     print("=" * 80 + "\n")
-
-
-def load_tickers_from_file(filepath):
-    """Load ticker symbols from a text file (one per line)."""
-    with open(filepath) as f:
-        return [line.strip().upper() for line in f if line.strip() and not line.startswith("#")]
 
 
 def main():
     global MIN_NET_INCOME, MIN_ROE, MIN_INTEREST_COVERAGE
 
     parser = argparse.ArgumentParser(
-        description="Buffett-Style Stock Screener — screen stocks using Warren Buffett's criteria"
+        description="Buffett-Style Stock Screener — powered by FMP API"
     )
     parser.add_argument(
-        "--tickers", nargs="+", metavar="SYM",
-        help="Ticker symbols to screen (e.g., AAPL MSFT GOOGL)"
-    )
-    parser.add_argument(
-        "--file", metavar="PATH",
-        help="Path to a text file with ticker symbols (one per line)"
+        "--api-key", metavar="KEY",
+        help="FMP API key (or set FMP_API_KEY env var)"
     )
     parser.add_argument(
         "--min-income", type=float, default=MIN_NET_INCOME,
@@ -366,12 +281,12 @@ def main():
         help=f"Minimum interest coverage ratio (default: {MIN_INTEREST_COVERAGE})"
     )
     parser.add_argument(
-        "--csv", metavar="PATH",
-        help="Export results to CSV file"
+        "--max-candidates", type=int, default=200,
+        help="Max stocks to screen per run (default: 200, fits free API tier)"
     )
     parser.add_argument(
-        "--all-us", action="store_true",
-        help="Screen ALL U.S. publicly traded stocks (fetches tickers dynamically)"
+        "--csv", metavar="PATH",
+        help="Export results to CSV file"
     )
     parser.add_argument(
         "--pass-only", action="store_true",
@@ -379,22 +294,21 @@ def main():
     )
     args = parser.parse_args()
 
+    api_key = args.api_key or os.environ.get("FMP_API_KEY")
+    if not api_key:
+        print("  ERROR: FMP API key required. Use --api-key or set FMP_API_KEY env var.\n")
+        sys.exit(1)
+
     MIN_NET_INCOME = args.min_income
     MIN_ROE = args.min_roe
     MIN_INTEREST_COVERAGE = args.min_interest_coverage
 
-    # Determine ticker list
-    if args.all_us:
-        tickers = fetch_us_tickers()
-    elif args.tickers:
-        tickers = [t.upper() for t in args.tickers]
-    elif args.file:
-        tickers = load_tickers_from_file(args.file)
-    else:
-        tickers = DEFAULT_TICKERS
+    print(f"\n  Buffett Stock Screener — scanning US market...\n")
+    df = run_screener(api_key, max_candidates=args.max_candidates)
 
-    print(f"\n  Buffett Stock Screener — screening {len(tickers)} stocks...\n")
-    df = run_screener(tickers, quick_reject=args.all_us)
+    if df.empty:
+        print("  No results found.\n")
+        sys.exit(0)
 
     if args.pass_only:
         df = df[df["_score"] == 4]
@@ -405,7 +319,7 @@ def main():
     else:
         print_results(df)
 
-    if args.csv:
+    if args.csv and not df.empty:
         export = df[[c for c in df.columns if c != "_score"]]
         export.to_csv(args.csv, index=False)
         print(f"  Results exported to {args.csv}\n")
