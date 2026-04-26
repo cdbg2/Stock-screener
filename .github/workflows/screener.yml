@@ -2,7 +2,7 @@ name: Buffett Stock Screener
 
 on:
   schedule:
-    - cron: "0 18 * * 1"  # Every Monday at 6 PM UTC (after US market close)
+    - cron: "0 21 * * 1"  # Every Monday at 9 PM UTC (5 PM Eastern, after market close)
   workflow_dispatch: # Allow manual trigger too
 
 permissions:
