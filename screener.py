@@ -30,7 +30,7 @@ import requests
 from tabulate import tabulate
 
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE = "https://financialmodelingprep.com/stable"
 
 # ── Buffett criteria thresholds (edit these to taste) ────────────────────────
 MIN_NET_INCOME = 75_000_000
@@ -56,22 +56,22 @@ def fetch_candidates(api_key, index="sp500"):
     constituent endpoints which are available on the free tier.
     """
     endpoint_map = {
-        "sp500": "sp500_constituent",
-        "nasdaq100": "nasdaq_constituent",
-        "dow": "dowjones_constituent",
+        "sp500": "sp500-constituent",
+        "nasdaq100": "nasdaq-constituent",
+        "dow": "dowjones-constituent",
     }
-    endpoint = endpoint_map.get(index, "sp500_constituent")
+    endpoint = endpoint_map.get(index, "sp500-constituent")
     data = fmp_get(endpoint, api_key)
     # Constituent endpoints return: symbol, name, sector, subSector, ...
     return data
 
 
 def fetch_income_statements(symbol, api_key):
-    return fmp_get(f"income-statement/{symbol}", api_key, {"limit": 5, "period": "annual"})
+    return fmp_get("income-statement", api_key, {"symbol": symbol, "limit": 5, "period": "annual"})
 
 
 def fetch_balance_sheet(symbol, api_key):
-    data = fmp_get(f"balance-sheet-statement/{symbol}", api_key, {"limit": 1, "period": "annual"})
+    data = fmp_get("balance-sheet-statement", api_key, {"symbol": symbol, "limit": 1, "period": "annual"})
     return data[0] if data else {}
 
 
