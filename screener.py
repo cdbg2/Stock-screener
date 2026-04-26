@@ -37,7 +37,6 @@ MIN_NET_INCOME = 75_000_000
 MIN_ROE = 0.10
 MIN_INTEREST_COVERAGE = 1.0
 EPS_GROWTH_YEARS = 5
-MIN_MARKET_CAP = 2_000_000_000  # pre-filter for API efficiency
 
 
 def fmp_get(endpoint, api_key, params=None):
@@ -50,15 +49,20 @@ def fmp_get(endpoint, api_key, params=None):
     return resp.json()
 
 
-def fetch_candidates(api_key):
-    data = fmp_get("stock-screener", api_key, {
-        "marketCapMoreThan": MIN_MARKET_CAP,
-        "isActivelyTrading": "true",
-        "country": "US",
-        "exchange": "NYSE,NASDAQ,AMEX",
-        "limit": 5000,
-    })
-    data.sort(key=lambda x: x.get("marketCap", 0), reverse=True)
+def fetch_candidates(api_key, index="sp500"):
+    """Fetch constituents of a major US stock index.
+
+    Free FMP tier doesn't support /stock-screener, so we use index
+    constituent endpoints which are available on the free tier.
+    """
+    endpoint_map = {
+        "sp500": "sp500_constituent",
+        "nasdaq100": "nasdaq_constituent",
+        "dow": "dowjones_constituent",
+    }
+    endpoint = endpoint_map.get(index, "sp500_constituent")
+    data = fmp_get(endpoint, api_key)
+    # Constituent endpoints return: symbol, name, sector, subSector, ...
     return data
 
 
@@ -110,19 +114,22 @@ def compute_roe(net_income, balance_sheet):
     return None
 
 
-def run_screener(api_key, max_candidates=200):
+def run_screener(api_key, max_candidates=120, index="sp500"):
     t0 = time.time()
 
-    # ── Phase 1: Get candidates from FMP screener (1 API call) ───────────
-    print("  Phase 1: Fetching US stock candidates...")
-    candidates = fetch_candidates(api_key)
+    # ── Phase 1: Get index constituents (1 API call) ─────────────────────
+    index_label = {"sp500": "S&P 500", "nasdaq100": "NASDAQ 100", "dow": "Dow 30"}[index]
+    print(f"  Phase 1: Fetching {index_label} constituents...")
+    candidates = fetch_candidates(api_key, index=index)
     if not candidates:
         print("  ERROR: No candidates returned. Check your API key.\n")
         return pd.DataFrame()
 
+    total_universe = len(candidates)
     candidates = candidates[:max_candidates]
     api_calls = 1
-    print(f"           {len(candidates)} stocks with marketCap > ${MIN_MARKET_CAP / 1e9:.0f}B\n")
+    print(f"           Screening {len(candidates)} of {total_universe} stocks "
+          f"(API budget limit; raise --max-candidates if on paid plan)\n")
 
     # ── Phase 2: Income statements — check 3 of 4 criteria (N calls) ────
     print("  Phase 2: Checking income, EPS growth & interest coverage...")
@@ -281,8 +288,12 @@ def main():
         help=f"Minimum interest coverage ratio (default: {MIN_INTEREST_COVERAGE})"
     )
     parser.add_argument(
-        "--max-candidates", type=int, default=200,
-        help="Max stocks to screen per run (default: 200, fits free API tier)"
+        "--max-candidates", type=int, default=120,
+        help="Max stocks to screen per run (default: 120, fits free API tier)"
+    )
+    parser.add_argument(
+        "--index", choices=["sp500", "nasdaq100", "dow"], default="sp500",
+        help="Stock index to screen (default: sp500)"
     )
     parser.add_argument(
         "--csv", metavar="PATH",
@@ -304,7 +315,7 @@ def main():
     MIN_INTEREST_COVERAGE = args.min_interest_coverage
 
     print(f"\n  Buffett Stock Screener — scanning US market...\n")
-    df = run_screener(api_key, max_candidates=args.max_candidates)
+    df = run_screener(api_key, max_candidates=args.max_candidates, index=args.index)
 
     if df.empty:
         print("  No results found.\n")
