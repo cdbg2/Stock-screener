@@ -1,1 +1,3 @@
-Ticker,Company,Net Income ($M),Income ≥$75M,EPS 5yr Growth,ROE (%),ROE >10%,Int. Coverage,Int.Cov >1,Insider %,Score
+Ticker,Company,Net Income ($M),Income ≥$75M,EPS 5yr Growth,ROE (%),ROE >10%,Int. Coverage,Int.Cov >1,Score
+HOOD,HOOD,"1,883",PASS,PASS,20.6,PASS,No Debt,PASS,4/4
+PLTR,PLTR,"1,625",PASS,PASS,22.0,PASS,No Debt,PASS,4/4
