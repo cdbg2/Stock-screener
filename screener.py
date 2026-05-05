@@ -288,8 +288,8 @@ def main():
         help=f"Minimum interest coverage ratio (default: {MIN_INTEREST_COVERAGE})"
     )
     parser.add_argument(
-        "--max-candidates", type=int, default=120,
-        help="Max stocks to screen per run (default: 120, fits free API tier)"
+        "--max-candidates", type=int, default=200,
+        help="Max stocks to screen per run (default: 200, fits free API tier)"
     )
     parser.add_argument(
         "--index", choices=["sp500", "nasdaq100", "dow"], default="sp500",
