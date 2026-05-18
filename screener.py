@@ -29,6 +29,8 @@ import pandas as pd
 import requests
 from tabulate import tabulate
 
+from constituents import SP500, NASDAQ100, DOW30
+
 
 FMP_BASE = "https://financialmodelingprep.com/stable"
 
@@ -49,21 +51,11 @@ def fmp_get(endpoint, api_key, params=None):
     return resp.json()
 
 
-def fetch_candidates(api_key, index="sp500"):
-    """Fetch constituents of a major US stock index.
-
-    Free FMP tier doesn't support /stock-screener, so we use index
-    constituent endpoints which are available on the free tier.
-    """
-    endpoint_map = {
-        "sp500": "sp500-constituent",
-        "nasdaq100": "nasdaq-constituent",
-        "dow": "dowjones-constituent",
-    }
-    endpoint = endpoint_map.get(index, "sp500-constituent")
-    data = fmp_get(endpoint, api_key)
-    # Constituent endpoints return: symbol, name, sector, subSector, ...
-    return data
+def get_candidates(index="sp500"):
+    """Return index constituents from bundled static lists (no API call needed)."""
+    ticker_lists = {"sp500": SP500, "nasdaq100": NASDAQ100, "dow": DOW30}
+    tickers = ticker_lists.get(index, SP500)
+    return [{"symbol": t, "companyName": t} for t in tickers]
 
 
 def fetch_income_statements(symbol, api_key):
@@ -117,17 +109,14 @@ def compute_roe(net_income, balance_sheet):
 def run_screener(api_key, max_candidates=120, index="sp500"):
     t0 = time.time()
 
-    # ── Phase 1: Get index constituents (1 API call) ─────────────────────
+    # ── Phase 1: Get index constituents (from bundled list, no API call) ──
     index_label = {"sp500": "S&P 500", "nasdaq100": "NASDAQ 100", "dow": "Dow 30"}[index]
-    print(f"  Phase 1: Fetching {index_label} constituents...")
-    candidates = fetch_candidates(api_key, index=index)
-    if not candidates:
-        print("  ERROR: No candidates returned. Check your API key.\n")
-        return pd.DataFrame()
+    print(f"  Phase 1: Loading {index_label} constituents...")
+    candidates = get_candidates(index=index)
 
     total_universe = len(candidates)
     candidates = candidates[:max_candidates]
-    api_calls = 1
+    api_calls = 0
     print(f"           Screening {len(candidates)} of {total_universe} stocks "
           f"(API budget limit; raise --max-candidates if on paid plan)\n")
 
