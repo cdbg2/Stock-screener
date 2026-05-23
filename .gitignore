@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.csv
 !results.csv
+!partials/*.csv

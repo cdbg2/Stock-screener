@@ -29,7 +29,11 @@ import pandas as pd
 import requests
 from tabulate import tabulate
 
+from batch import split_into_batches, save_partial, all_batches_complete, combine_partials, clear_partials
 from constituents import SP500, NASDAQ100, DOW30
+
+NUM_BATCHES = 5
+PARTIALS_DIR = "partials"
 
 
 FMP_BASE = "https://financialmodelingprep.com/stable"
@@ -106,19 +110,22 @@ def compute_roe(net_income, balance_sheet):
     return None
 
 
-def run_screener(api_key, max_candidates=120, index="sp500"):
+def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None):
     t0 = time.time()
 
     # ── Phase 1: Get index constituents (from bundled list, no API call) ──
     index_label = {"sp500": "S&P 500", "nasdaq100": "NASDAQ 100", "dow": "Dow 30"}[index]
-    print(f"  Phase 1: Loading {index_label} constituents...")
-    candidates = get_candidates(index=index)
+    if ticker_subset:
+        candidates = [{"symbol": t, "companyName": t} for t in ticker_subset]
+        print(f"  Phase 1: Screening batch of {len(candidates)} {index_label} stocks...")
+    else:
+        print(f"  Phase 1: Loading {index_label} constituents...")
+        candidates = get_candidates(index=index)
+        if max_candidates:
+            candidates = candidates[:max_candidates]
 
-    total_universe = len(candidates)
-    candidates = candidates[:max_candidates]
     api_calls = 0
-    print(f"           Screening {len(candidates)} of {total_universe} stocks "
-          f"(API budget limit; raise --max-candidates if on paid plan)\n")
+    print(f"           {len(candidates)} stocks to screen\n")
 
     # ── Phase 2: Income statements — check 3 of 4 criteria (N calls) ────
     print("  Phase 2: Checking income, EPS growth & interest coverage...")
@@ -292,6 +299,11 @@ def main():
         "--pass-only", action="store_true",
         help="Only include passing stocks (score 4/4) in output and CSV"
     )
+    parser.add_argument(
+        "--batch", type=int, metavar="N",
+        help="Run batch N (0-4) of the index. Saves partial results to partials/ dir. "
+             "When all 5 batches are done, combines into final results."
+    )
     args = parser.parse_args()
 
     api_key = args.api_key or os.environ.get("FMP_API_KEY")
@@ -303,12 +315,59 @@ def main():
     MIN_ROE = args.min_roe
     MIN_INTEREST_COVERAGE = args.min_interest_coverage
 
+    if args.batch is not None:
+        run_batch_mode(api_key, args)
+    else:
+        run_full_mode(api_key, args)
+
+
+def run_full_mode(api_key, args):
     print(f"\n  Buffett Stock Screener — scanning US market...\n")
     df = run_screener(api_key, max_candidates=args.max_candidates, index=args.index)
+    output_results(df, args)
+
+
+def run_batch_mode(api_key, args):
+    batch_index = args.batch
+    if not 0 <= batch_index < NUM_BATCHES:
+        print(f"  ERROR: --batch must be 0-{NUM_BATCHES - 1}\n")
+        sys.exit(1)
+
+    all_tickers = get_candidates(index=args.index)
+    all_symbols = [c["symbol"] for c in all_tickers]
+    batches = split_into_batches(all_symbols, NUM_BATCHES)
+    ticker_subset = batches[batch_index]
+
+    print(f"\n  Buffett Stock Screener — batch {batch_index + 1}/{NUM_BATCHES} "
+          f"({len(ticker_subset)} stocks)...\n")
+
+    df = run_screener(api_key, index=args.index, ticker_subset=ticker_subset)
 
     if df.empty:
+        df = pd.DataFrame(columns=["Ticker", "Company", "Net Income ($M)",
+                                    "Income ≥$75M", "EPS 5yr Growth", "ROE (%)",
+                                    "ROE >10%", "Int. Coverage", "Int.Cov >1",
+                                    "Score", "_score"])
+
+    save_partial(df, batch_index, PARTIALS_DIR)
+    print(f"  Saved batch {batch_index} results to {PARTIALS_DIR}/\n")
+
+    if all_batches_complete(PARTIALS_DIR, NUM_BATCHES):
+        print("  All batches complete! Combining results...\n")
+        combined = combine_partials(PARTIALS_DIR, NUM_BATCHES)
+        output_results(combined, args)
+        clear_partials(PARTIALS_DIR, NUM_BATCHES)
+    else:
+        done = sum(1 for i in range(NUM_BATCHES)
+                   if os.path.exists(os.path.join(PARTIALS_DIR, f"batch_{i}.csv")))
+        print(f"  Progress: {done}/{NUM_BATCHES} batches complete. "
+              f"Run remaining batches to get final results.\n")
+
+
+def output_results(df, args):
+    if df.empty:
         print("  No results found.\n")
-        sys.exit(0)
+        return
 
     if args.pass_only:
         df = df[df["_score"] == 4]
