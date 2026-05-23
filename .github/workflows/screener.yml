@@ -2,8 +2,12 @@ name: Buffett Stock Screener
 
 on:
   schedule:
-    - cron: "0 21 * * 1"  # Every Monday at 9 PM UTC (5 PM Eastern, after market close)
-  workflow_dispatch: # Allow manual trigger too
+    - cron: "0 21 * * 1-5"  # Mon-Fri at 9 PM UTC (5 PM Eastern, after market close)
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: "Batch number (0-4), or leave empty for auto (weekday-based)"
+        required: false
 
 permissions:
   contents: write
@@ -21,23 +25,41 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run screener
+      - name: Determine batch number
+        id: batch
+        run: |
+          if [ -n "${{ github.event.inputs.batch }}" ]; then
+            echo "num=${{ github.event.inputs.batch }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "num=$(( $(date -u +%u) - 1 ))" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run screener (batch ${{ steps.batch.outputs.num }})
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-        run: python screener.py --pass-only --csv results.csv
+        run: python screener.py --batch ${{ steps.batch.outputs.num }} --pass-only --csv results.csv
         timeout-minutes: 10
 
-      - name: Upload results
+      - name: Upload batch results
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-batch-${{ steps.batch.outputs.num }}
+          path: partials/
+          retention-days: 30
+
+      - name: Upload final results
+        if: hashFiles('results.csv') != ''
         uses: actions/upload-artifact@v4
         with:
           name: screener-results
           path: results.csv
           retention-days: 30
 
-      - name: Update results in repo
+      - name: Commit results to repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f results.csv
-          git diff --cached --quiet || git commit -m "Update screener results $(date -u +%Y-%m-%d)"
+          git add -f partials/
+          git add -f results.csv 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Screener batch ${{ steps.batch.outputs.num }} $(date -u +%Y-%m-%d)"
           git push
