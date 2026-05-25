@@ -110,7 +110,7 @@ def compute_roe(net_income, balance_sheet):
     return None
 
 
-def run_screener(api_key, max_candidates=200, index="sp500"):
+def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None):
     t0 = time.time()
 
     # ── Phase 1: Get index constituents (from bundled list, no API call) ──
