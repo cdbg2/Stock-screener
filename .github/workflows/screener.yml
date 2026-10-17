@@ -6,6 +6,10 @@ on:
     paths:
       - screener.py
       - batch.py
+      - sec_data.py
+      - requirements.txt
+      - test_*.py
+      - tests/**
       - .github/workflows/screener.yml
   schedule:
     - cron: "0 21 * * 1-5"  # Mon-Fri at 9 PM UTC (5 PM Eastern, after market close)
@@ -14,6 +18,10 @@ on:
       batch:
         description: "Batch number (0-4), or leave empty to resume the next missing batch"
         required: false
+      full_scan:
+        description: "Rebuild the entire index now instead of resuming one batch"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,25 +46,29 @@ jobs:
       - name: Run regression tests
         run: python -m pytest -q
 
-      - name: Run next missing batch
+      - name: Run SEC screener
         id: screen
         env:
-          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || 'ChasDeistStockScreener/2.0 (https://github.com/cdbg2/Stock-screener)' }}
           BATCH_INPUT: ${{ github.event.inputs.batch }}
+          EVENT_NAME: ${{ github.event_name }}
+          FULL_SCAN: ${{ github.event.inputs.full_scan }}
         run: |
-          if [ -n "$BATCH_INPUT" ]; then
+          if [ "$EVENT_NAME" = "push" ] || [ "$FULL_SCAN" = "true" ]; then
+            python -u screener.py --pass-only --csv results.csv
+          elif [ -n "$BATCH_INPUT" ]; then
             python screener.py --batch "$BATCH_INPUT" --pass-only --csv results.csv
           else
             python screener.py --next-batch --pass-only --csv results.csv
           fi
-        timeout-minutes: 10
+        timeout-minutes: 25
 
       - name: Upload batch results
-        if: hashFiles('partials/*.csv') != ''
+        if: hashFiles('partials/sec-v1/*.csv') != ''
         uses: actions/upload-artifact@v4
         with:
           name: screener-partials
-          path: partials/
+          path: partials/sec-v1/
           retention-days: 30
 
       - name: Upload final results
@@ -64,14 +76,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: screener-results
-          path: results.csv
+          path: |
+            results.csv
+            coverage.csv
+            report.json
           retention-days: 30
 
       - name: Commit results to repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f partials/
-          git add -f results.csv 2>/dev/null || true
+          mkdir -p partials/sec-v1
+          git add -A -f partials/
+          for report in results.csv coverage.csv report.json; do
+            if [ -f "$report" ]; then git add -f "$report"; fi
+          done
           git diff --cached --quiet || git commit -m "Update screener progress $(date -u +%Y-%m-%d)"
           git push

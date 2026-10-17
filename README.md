@@ -1,61 +1,65 @@
 # Buffett-Style Stock Screener
 
-A simple, repeatable stock screener based on Warren Buffett's criteria for identifying good companies to invest in.
+Free, repeatable screening of the bundled S&P 500, NASDAQ 100, or Dow stock lists using annual financial facts from SEC EDGAR. No FMP account, subscription, or API key is needed.
 
 ## Criteria
 
-| # | Criterion | Threshold | Automated? |
-|---|-----------|-----------|------------|
-| 1 | **Cash Available** | Net Income ≥ $75M | Yes |
-| 2 | **Consistent Growth** | Positive EPS growth each of the past 5 years | Yes |
-| 3 | **Good ROI** | Return on Equity > 10% | Yes |
-| 4 | **Low Debt Obligations** | Interest Coverage Ratio > 1 | Yes |
-| 5 | **Committed Managers** | Insider ownership % (flagged for review) | Partial |
-| 6 | **Simple Business Model** | Manual review required | No |
+| Criterion | Test |
+|---|---|
+| Earnings size | Latest annual net income ≥ $75 million |
+| Consistent EPS growth | EPS increased in each of five consecutive year-over-year comparisons: **six annual observations** |
+| Return on equity | Latest annual net income / same-year closing shareholders' equity > 10% |
+| Interest coverage | Same-year operating income / interest expense > 1 |
 
-## Setup
+Management commitment and business simplicity require manual research. This implementation does not retrieve insider ownership. Net income is earnings, not cash on hand. ROE uses closing equity, not average equity. These are screening rules, not a valuation model.
+
+## Run locally
 
 ```bash
 pip install -r requirements.txt
+python -m pytest -q
+python screener.py --pass-only --csv results.csv
+python screener.py --tickers AAPL MSFT KO BRK.B --pass-only --csv results.csv
+python screener.py --index nasdaq100 --pass-only --csv results.csv
+python screener.py --max-candidates 10 --csv results.csv
+python screener.py --file tickers.txt --csv results.csv
 ```
 
-## Usage
+Thresholds can be changed with `--min-income`, `--min-roe` (decimal), and `--min-interest-coverage`. Without `--pass-only`, the primary CSV includes every attempted stock.
+
+SEC requests identify this project in the User-Agent, run sequentially at no more than four requests per second, and retry temporary errors with backoff. You can override the identification with `SEC_USER_AGENT` or `--user-agent` (SEC recommends an organization/name and contact email). No authentication is involved. Responses are cached locally in `.cache/sec/` for the current UTC day; that cache is not committed.
+
+## Reports
+
+- **results.csv:** passing stocks when `--pass-only` is used. A completed scan with no passes replaces old results with a header-only CSV.
+- **coverage.csv:** every attempted stock, including `PASS`, `FAIL`, and `NOT EVALUATED`, with reasons for missing data. Includes raw metric values, fiscal periods, retrieval timestamps, SEC filing links, and the exact source tags/accessions used. This is the audit for coverage; a short pass list does not imply complete evaluation of the index.
+- **report.json:** source, thresholds, generation time, attempted/pass/fail/not-evaluated counts.
+
+Reports are committed to the repository and attached as a `screener-results` artifact only when regenerated. The same three reports are written alongside a custom `--csv` path. `--coverage` can override the audit file path.
+
+## Data handling and limits
+
+Data comes from the SEC's [Company Facts and submissions APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces), with tickers mapped through the [SEC ticker file](https://www.sec.gov/files/company_tickers.json).
+
+- Identify the latest annual filing in SEC submissions. Select full-year (330–380 day) observations from annual filings, not quarterly or trailing periods. Use actual start/end dates; the XBRL `fy` field can describe the filing rather than a comparative fact's year.
+- Match income, operating income, interest expense, and closing equity to the same fiscal period. Prefer the latest filed/restated fact within a supported tag. Keep all six EPS observations on one definition (diluted when available, otherwise basic). Reject gaps or incompatible stock-split histories rather than guessing an adjustment.
+- Only entity-wide US-GAAP facts in USD (USD/share for EPS) and supported standard tags are mapped. Custom company tags, IFRS-only data, new issuers, class-specific EPS, and unavailable fields may prevent evaluation. This means all listed symbols can be attempted, but **not every company will have enough supported data to receive a score**.
+- Missing interest expense stays unknown. Explicitly reported zero interest expense can pass the coverage test if operating income is positive; it does not imply the company has no debt. Non-positive equity is marked not evaluated for ROE.
+- A stock missing any required criterion is `NOT EVALUATED`, never a full pass or an ordinary business failure. SEC access denial, exhausted rate-limit/connection retries, or no retrieved company data fails the run without replacing the final reports.
+- Index lists are bundled snapshots in `constituents.py`, not automatically refreshed index membership. Check that file's update date; unmapped/outdated tickers are visible in the audit.
+
+These conservative rules trade some coverage for traceable calculations. The fixture tests include extracted public SEC data for Apple, Microsoft, and Coca-Cola, as downloaded October 17, 2026; fixture files retain the source URL and period metadata.
+
+## Automation
+
+The GitHub Actions workflow runs weekdays at 21:00 UTC (5 PM Eastern during daylight saving time, 4 PM during standard time). Each scheduled run resumes the next missing batch, independent of the weekday on which the runner actually starts. Five completed batches produce a full report and clear the partials for the next cycle. Runs are serialized.
+
+Code changes on `main` trigger a full rebuild, so source changes take effect immediately. In **Actions → Buffett Stock Screener → Run workflow**, leave inputs empty to resume a batch, enter a batch number 0–4 to rerun one, or select **full_scan** to rebuild the entire index now. Full scans take precedence over the batch input and discard the previous SEC batch cycle only after successfully writing their reports.
+
+SEC batch files live in `partials/sec-v1/`, separate from legacy FMP partials. To resume locally:
 
 ```bash
-# Screen default set of 40 large-cap stocks
-python screener.py
-
-# Screen specific tickers
-python screener.py --tickers AAPL MSFT GOOGL BRK-B KO
-
-# Screen tickers from a file
-python screener.py --file tickers.txt
-
-# Customize thresholds
-python screener.py --tickers AAPL MSFT --min-income 50000000 --min-roe 0.15
-
-# Export results to CSV
-python screener.py --csv results.csv
+python screener.py --next-batch --pass-only --csv results.csv
 ```
 
-## Output
-
-Stocks are scored 0-4 based on the quantitative criteria and sorted by score. Results are grouped into:
-
-- **FULL PASS** — All 4 quantitative criteria met
-- **PARTIAL PASS** — Some criteria met
-- **FAIL** — No criteria met
-
-Insider ownership % is displayed for manual review of the "Committed Managers" criterion. The "Simple Business Model" criterion requires your own research into the company.
-
-## Automated Runs
-
-A GitHub Actions workflow runs every weekday at 21:00 UTC (5 PM Eastern during daylight saving time, 4 PM during standard time). It also runs when screener code or the workflow changes on `main`.
-
-Each run resumes the next missing batch (0–4), regardless of delays or the weekday the runner starts. Once all five batches exist, it refreshes `results.csv` and clears the partials for the next cycle. Partial progress is committed between runs. Runs are serialized to prevent conflicting updates.
-
-You can trigger it manually from the **Actions** tab. Leave `batch` empty to resume, or specify 0–4 to rerun a particular batch. For local use: `python screener.py --next-batch --pass-only --csv results.csv`.
-
-The `screener-results` artifact is uploaded only when final results were regenerated. A completed cycle with no passing stocks produces a header-only CSV, replacing previous results.
-
-Provider errors are summarized in the run log and Actions summary, including affected tickers. Stocks with unavailable data cannot be fully evaluated; a successful run with warnings is incomplete coverage, not proof that those stocks failed the criteria. If all income or all balance-sheet requests fail, the run fails without saving that batch or replacing published results. Check coverage warnings before relying on a report. Existing partials from before this change do not contain coverage diagnostics.
+FMP secrets are no longer read or required. An optional repository variable `SEC_USER_AGENT` overrides the default project identification.

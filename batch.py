@@ -1,4 +1,4 @@
-"""Multi-day batch scheduling for FMP free tier (250 calls/day)."""
+"""Resumable multi-day batches to keep SEC downloads small."""
 
 import os
 

@@ -1,450 +1,228 @@
 #!/usr/bin/env python3
-"""
-Buffett-Style Stock Screener
-=============================
-Screens U.S. mid-to-large cap stocks using Warren Buffett's criteria:
-
-1. Cash Available      - Net income >= $75 million
-2. Consistent Growth   - Positive EPS growth each of the past 5 years
-3. Good ROI            - Return on Equity > 10%
-4. Low Debt            - Interest coverage ratio > 1
-5. Committed Managers  - Insider ownership % (flagged for review)
-6. Simple Business     - Manual review required
-
-Uses the Financial Modeling Prep (FMP) API for fast data retrieval.
-
-Usage:
-    python screener.py                             # screen all US mid-to-large cap
-    python screener.py --api-key YOUR_KEY          # provide API key directly
-    python screener.py --pass-only --csv out.csv   # export only full-pass stocks
-"""
-
+"""Buffett-style screening from free SEC EDGAR annual financial facts."""
 import argparse
-import os
-import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+from datetime import datetime, timezone
+import json
+import math
+import os
+from pathlib import Path
 
 import pandas as pd
 import requests
 from tabulate import tabulate
 
-from batch import split_into_batches, save_partial, all_batches_complete, combine_partials, clear_partials, next_missing_batch
+from batch import (split_into_batches, save_partial, all_batches_complete,
+                   combine_partials, clear_partials, next_missing_batch)
 from constituents import SP500, NASDAQ100, DOW30
+from sec_data import SecClient, SecAccessError
 
 NUM_BATCHES = 5
-PARTIALS_DIR = "partials"
-
-
-FMP_BASE = "https://financialmodelingprep.com/stable"
-
-# ── Buffett criteria thresholds (edit these to taste) ────────────────────────
+# Separate schema/source namespace: never combine old FMP partials with SEC rows.
+PARTIALS_DIR = "partials/sec-v1"
 MIN_NET_INCOME = 75_000_000
-MIN_ROE = 0.10
+MIN_ROE = .10
 MIN_INTEREST_COVERAGE = 1.0
-EPS_GROWTH_YEARS = 5
-
-
-def fmp_get(endpoint, api_key, params=None):
-    url = f"{FMP_BASE}/{endpoint}"
-    p = {"apikey": api_key}
-    if params:
-        p.update(params)
-    resp = requests.get(url, params=p, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if not isinstance(data, list):
-        # Do not print provider responses or request URLs: they can contain the API key.
-        raise ValueError("Unexpected provider response")
-    return data
-
-
-def report_fetch_errors(phase, attempted, errors):
-    """Expose incomplete coverage without leaking request URLs or credentials."""
-    if not errors:
-        return
-    counts = Counter(errors.values())
-    detail = ", ".join(f"{reason}: {count}" for reason, count in sorted(counts.items()))
-    message = (f"{phase}: data unavailable for {len(errors)}/{attempted} stocks "
-               f"({detail}). These stocks could not be fully evaluated.")
-    print(f"  WARNING: {message}")
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        print(f"::warning::{message}")
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a") as f:
-            f.write(f"\n- {message}\n  Affected tickers: {', '.join(sorted(errors))}\n")
-
-
-def error_category(error):
-    if isinstance(error, requests.HTTPError) and error.response is not None:
-        return f"HTTP {error.response.status_code}"
-    return type(error).__name__
+COLUMNS = ["Ticker", "Company", "Net Income ($M)", "Income ≥$75M", "EPS 5yr Growth",
+           "ROE (%)", "ROE >10%", "Int. Coverage", "Int.Cov >1", "Score",
+           "Evaluation", "Reason", "Fiscal Year End", "As Of UTC", "SEC CIK",
+           "SEC Filing", "SEC Facts", "Net Income (USD)", "Equity (USD)",
+           "Operating Income (USD)", "Interest Expense (USD)", "EPS Annual Values",
+           "Fact Sources", "_score"]
 
 
 def get_candidates(index="sp500"):
-    """Return index constituents from bundled static lists (no API call needed)."""
-    ticker_lists = {"sp500": SP500, "nasdaq100": NASDAQ100, "dow": DOW30}
-    tickers = ticker_lists.get(index, SP500)
-    return [{"symbol": t, "companyName": t} for t in tickers]
+    lists = {"sp500": SP500, "nasdaq100": NASDAQ100, "dow": DOW30}
+    return [{"symbol": t, "companyName": t} for t in lists[index]]
 
 
-def fetch_income_statements(symbol, api_key):
-    return fmp_get("income-statement", api_key, {"symbol": symbol, "limit": 5, "period": "annual"})
+def evaluate(symbol, metrics):
+    """Unknown data cannot pass a criterion or be presented as a failed business."""
+    income = metrics.get("net_income")
+    equity = metrics.get("equity")
+    operating = metrics.get("operating_income")
+    interest = metrics.get("interest_expense")
+    eps = metrics.get("eps", [])
+    issues = list(metrics.get("issues", []))
+    roe = income / equity if income is not None and equity is not None and equity > 0 else None
+    if equity is not None and equity <= 0:
+        issues.append("ROE not meaningful with non-positive shareholders' equity")
+    coverage = None
+    if operating is not None and interest is not None:
+        if interest > 0:
+            coverage = operating / interest
+        elif interest == 0 and operating > 0:
+            coverage = math.inf
+        elif interest == 0:
+            coverage = 0.0
+        else:
+            issues.append("Negative interest expense requires manual review")
+    checks = [income >= MIN_NET_INCOME if income is not None else None,
+              all(b > a for a, b in zip(eps, eps[1:])) if len(eps) == 6 else None,
+              roe > MIN_ROE if roe is not None else None,
+              coverage > MIN_INTEREST_COVERAGE if coverage is not None else None]
+    score = sum(c is True for c in checks)
+    missing = any(c is None for c in checks)
+    status = "NOT EVALUATED" if missing else ("PASS" if score == 4 else "FAIL")
+    def label(value):
+        return "NOT EVALUATED" if value is None else ("PASS" if value else "FAIL")
+    filing = metrics.get("filing", {})
+    cik = metrics.get("cik", "")
+    accession = filing.get("accession", "")
+    filing_url = (f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{accession}-index.html"
+                  if cik and accession else "")
+    return {"Ticker": symbol, "Company": metrics.get("company") or symbol,
+            "Net Income ($M)": round(income / 1e6, 2) if income is not None else None,
+            "Income ≥$75M": label(checks[0]), "EPS 5yr Growth": label(checks[1]),
+            "ROE (%)": round(roe * 100, 2) if roe is not None else None,
+            "ROE >10%": label(checks[2]),
+            "Int. Coverage": "No interest expense" if coverage == math.inf else (round(coverage, 2) if coverage is not None else None),
+            "Int.Cov >1": label(checks[3]), "Score": f"{score}/4" if not missing else "NOT EVALUATED",
+            "Evaluation": status, "Reason": "; ".join(dict.fromkeys(issues)),
+            "Fiscal Year End": metrics.get("period_end", ""),
+            "As Of UTC": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "SEC CIK": cik, "SEC Filing": filing_url, "SEC Facts": metrics.get("source_url", ""),
+            "Net Income (USD)": income, "Equity (USD)": equity,
+            "Operating Income (USD)": operating, "Interest Expense (USD)": interest,
+            "EPS Annual Values": json.dumps(eps), "Fact Sources": json.dumps(metrics.get("tags", {}), sort_keys=True),
+            "_score": score}
 
 
-def fetch_balance_sheet(symbol, api_key):
-    data = fmp_get("balance-sheet-statement", api_key, {"symbol": symbol, "limit": 1, "period": "annual"})
-    return data[0] if data else {}
-
-
-def check_income_criteria(statements):
-    if not statements:
-        return None, [], None, None
-
-    sorted_stmts = sorted(statements, key=lambda x: x.get("date", ""))
-
-    net_income = sorted_stmts[-1].get("netIncome")
-
-    eps_list = []
-    for s in sorted_stmts:
-        eps = s.get("epsdiluted") or s.get("eps")
-        if eps is not None:
-            eps_list.append(eps)
-
-    eps_growing = None
-    if len(eps_list) >= EPS_GROWTH_YEARS:
-        recent = eps_list[-EPS_GROWTH_YEARS:]
-        eps_growing = all(recent[i] > recent[i - 1] for i in range(1, len(recent)))
-
-    latest = sorted_stmts[-1]
-    op_income = latest.get("operatingIncome") or 0
-    int_expense = abs(latest.get("interestExpense") or 0)
-    if int_expense > 0:
-        interest_cov = op_income / int_expense
-    elif op_income > 0:
-        interest_cov = float("inf")
-    else:
-        interest_cov = None
-
-    return net_income, eps_list, eps_growing, interest_cov
-
-
-def compute_roe(net_income, balance_sheet):
-    equity = balance_sheet.get("totalStockholdersEquity")
-    if equity and equity != 0 and net_income is not None:
-        return net_income / equity
-    return None
-
-
-def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None):
-    t0 = time.time()
-
-    # ── Phase 1: Get index constituents (from bundled list, no API call) ──
-    index_label = {"sp500": "S&P 500", "nasdaq100": "NASDAQ 100", "dow": "Dow 30"}[index]
-    if ticker_subset:
-        candidates = [{"symbol": t, "companyName": t} for t in ticker_subset]
-        print(f"  Phase 1: Screening batch of {len(candidates)} {index_label} stocks...")
-    else:
-        print(f"  Phase 1: Loading {index_label} constituents...")
-        candidates = get_candidates(index=index)
-        if max_candidates:
-            candidates = candidates[:max_candidates]
-
-    api_calls = 0
-    print(f"           {len(candidates)} stocks to screen\n")
-
-    # ── Phase 2: Income statements — check 3 of 4 criteria (N calls) ────
-    print("  Phase 2: Checking income, EPS growth & interest coverage...")
-    phase2_pass = []
-    income_errors = {}
-    done = 0
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {}
-        for c in candidates:
-            f = executor.submit(fetch_income_statements, c["symbol"], api_key)
-            futures[f] = c
-
-        for f in as_completed(futures):
-            done += 1
-            c = futures[f]
-            print(f"           [{done}/{len(candidates)}] {c['symbol']}", end="\r")
-            api_calls += 1
-            try:
-                statements = f.result()
-                if not statements:
-                    raise ValueError("No income statements")
-                net_income, eps_list, eps_growing, int_cov = check_income_criteria(statements)
-
-                pass_income = net_income is not None and net_income >= MIN_NET_INCOME
-                if not pass_income:
-                    continue
-
-                phase2_pass.append({
-                    "symbol": c["symbol"],
-                    "name": (c.get("companyName") or c["symbol"])[:30],
-                    "net_income": net_income,
-                    "eps_list": eps_list,
-                    "eps_growing": eps_growing,
-                    "int_cov": int_cov,
-                    "pass_income": True,
-                    "pass_eps": eps_growing is True,
-                    "pass_int_cov": int_cov is not None and int_cov > MIN_INTEREST_COVERAGE,
-                })
-            except Exception as error:
-                income_errors[c["symbol"]] = error_category(error)
-
-    report_fetch_errors("Income statements", len(candidates), income_errors)
-    if candidates and len(income_errors) == len(candidates):
-        raise RuntimeError("No income data could be retrieved; batch was not saved.")
-
-    print(f"           {len(phase2_pass)} stocks pass ${MIN_NET_INCOME / 1e6:.0f}M income threshold{' ' * 20}\n")
-
-    if not phase2_pass:
-        return pd.DataFrame()
-
-    # ── Phase 3: Balance sheets — ROE check for survivors only (M calls) ─
-    print(f"  Phase 3: Checking ROE for {len(phase2_pass)} candidates...")
-    done = 0
-    balance_errors = {}
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {}
-        for r in phase2_pass:
-            f = executor.submit(fetch_balance_sheet, r["symbol"], api_key)
-            futures[f] = r
-
-        for f in as_completed(futures):
-            done += 1
-            r = futures[f]
-            print(f"           [{done}/{len(phase2_pass)}] {r['symbol']}", end="\r")
-            api_calls += 1
-            try:
-                bs = f.result()
-                if not bs:
-                    raise ValueError("No balance sheet")
-                roe = compute_roe(r["net_income"], bs)
-                r["roe"] = roe
-                r["pass_roe"] = roe is not None and roe >= MIN_ROE
-            except Exception as error:
-                r["roe"] = None
-                r["pass_roe"] = False
-                balance_errors[r["symbol"]] = error_category(error)
-
-    report_fetch_errors("Balance sheets", len(phase2_pass), balance_errors)
-    if len(balance_errors) == len(phase2_pass):
-        raise RuntimeError("No balance sheets could be retrieved; batch was not saved.")
-
-    elapsed = time.time() - t0
-    print(f"           Done. ({api_calls} API calls, {elapsed:.1f}s){' ' * 20}\n")
-
-    # ── Build results DataFrame ──────────────────────────────────────────
+def run_screener(client=None, max_candidates=None, index="sp500", ticker_subset=None):
+    client = client or SecClient()
+    symbols = ticker_subset if ticker_subset is not None else [c["symbol"] for c in get_candidates(index)]
+    if max_candidates is not None:
+        symbols = symbols[:max_candidates]
     rows = []
-    for r in phase2_pass:
-        score = sum([r["pass_income"], r["pass_eps"], r.get("pass_roe", False), r["pass_int_cov"]])
-        int_cov = r["int_cov"]
-        roe = r.get("roe")
-        rows.append({
-            "Ticker": r["symbol"],
-            "Company": r["name"],
-            "Net Income ($M)": f"{r['net_income'] / 1e6:,.0f}",
-            "Income ≥$75M": "PASS",
-            "EPS 5yr Growth": "PASS" if r["pass_eps"] else ("N/A" if r["eps_growing"] is None else "FAIL"),
-            "ROE (%)": f"{roe * 100:.1f}" if roe else "N/A",
-            "ROE >10%": "PASS" if r.get("pass_roe") else "FAIL",
-            "Int. Coverage": (
-                f"{int_cov:.1f}" if int_cov and int_cov != float("inf")
-                else ("No Debt" if int_cov == float("inf") else "N/A")
-            ),
-            "Int.Cov >1": "PASS" if r["pass_int_cov"] else "FAIL",
-            "Score": f"{score}/4",
-            "_score": score,
-        })
+    fetched = 0
+    for i, symbol in enumerate(symbols, 1):
+        print(f"[{i}/{len(symbols)}] {symbol}", flush=True)
+        try:
+            metrics = client.financials(symbol)
+            fetched += 1
+        except SecAccessError:
+            raise
+        except (requests.RequestException, ValueError, KeyError) as error:
+            reason = (f"SEC HTTP {error.response.status_code}" if isinstance(error, requests.HTTPError)
+                      and error.response is not None else str(error))
+            metrics = {"issues": [reason]}
+        rows.append(evaluate(symbol, metrics))
+    if symbols and not fetched:
+        raise RuntimeError("No SEC company data retrieved; results were not replaced")
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    if not df.empty:
+        df = df.sort_values(["_score", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+    counts = Counter(df["Evaluation"])
+    print(f"SEC coverage: {len(df)} attempted; {counts['PASS']} pass; {counts['FAIL']} fail; "
+          f"{counts['NOT EVALUATED']} not evaluated", flush=True)
+    if counts["NOT EVALUATED"] and os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{counts['NOT EVALUATED']}/{len(df)} stocks could not be fully evaluated; see coverage.csv")
+    return df
 
-    df = pd.DataFrame(rows)
-    return df.sort_values("_score", ascending=False)
+
+def output_results(df, args):
+    if df.empty and not len(df.columns):
+        df = pd.DataFrame(columns=COLUMNS)
+    public = df.drop(columns=["_score"], errors="ignore")
+    selected = public[public["Evaluation"] == "PASS"] if args.pass_only else public
+    print(tabulate(selected[["Ticker", "Company", "Score", "Evaluation"]], headers="keys", showindex=False))
+    if not args.csv:
+        return False
+    path = Path(args.csv)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Always publish an audit of ALL attempted companies, including insufficient data.
+    coverage_path = Path(getattr(args, "coverage", None) or path.with_name("coverage.csv"))
+    if coverage_path.resolve() == path.resolve():
+        raise ValueError("Passing results and coverage audit need different file paths")
+    coverage_path.parent.mkdir(parents=True, exist_ok=True)
+    public.to_csv(coverage_path, index=False)
+    selected.to_csv(path, index=False)
+    counts = Counter(public["Evaluation"])
+    summary = (f"SEC EDGAR report: {len(public)} attempted; {counts['PASS']} pass; "
+               f"{counts['FAIL']} fail; {counts['NOT EVALUATED']} not evaluated. "
+               "See coverage.csv for reasons, source periods, and filing links.")
+    print(summary)
+    report = {"source": "SEC EDGAR Company Facts + submissions", "schema": "sec-v1",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "attempted": len(public), "pass": counts["PASS"], "fail": counts["FAIL"],
+              "not_evaluated": counts["NOT EVALUATED"], "eps_growth_years": 5,
+              "eps_annual_observations": 6, "min_net_income_usd": MIN_NET_INCOME,
+              "min_roe_exclusive": MIN_ROE, "min_interest_coverage_exclusive": MIN_INTEREST_COVERAGE,
+              "universe": "custom" if getattr(args, "tickers", None) else args.index}
+    path.with_name("report.json").write_text(json.dumps(report, indent=2) + "\n")
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write(f"\n## Buffett screener\n\n{summary}\n\nFive YoY EPS increases require six consecutive annual EPS values.\n")
+    return True
 
 
-def print_results(df):
-    display_cols = [c for c in df.columns if c != "_score"]
-    passing = df[df["_score"] == 4]
-    partial = df[(df["_score"] > 0) & (df["_score"] < 4)]
+def run_full_mode(client, args):
+    df = run_screener(client, max_candidates=args.max_candidates, index=args.index,
+                      ticker_subset=getattr(args, "tickers", None))
+    updated = output_results(df, args)
+    # A full scan supersedes an unfinished batch cycle, but only after successful output.
+    if updated and not getattr(args, "tickers", None) and args.max_candidates is None:
+        clear_partials(PARTIALS_DIR, NUM_BATCHES)
+    return updated
 
-    print("\n" + "=" * 80)
-    print("  BUFFETT-STYLE STOCK SCREENER RESULTS")
-    print("=" * 80)
 
-    print(f"\n  Criteria: Net Income ≥ ${MIN_NET_INCOME / 1e6:.0f}M | "
-          f"EPS growth {EPS_GROWTH_YEARS}yr | ROE > {MIN_ROE * 100:.0f}% | "
-          f"Interest Coverage > {MIN_INTEREST_COVERAGE}")
-    print(f"  Stocks passing income threshold: {len(df)}")
+def run_batch_mode(client, args):
+    batch_index = next_missing_batch(PARTIALS_DIR, NUM_BATCHES) if args.next_batch else args.batch
+    if batch_index is None:
+        return finish_batches(args)
+    if not 0 <= batch_index < NUM_BATCHES:
+        raise ValueError(f"--batch must be 0-{NUM_BATCHES - 1}")
+    symbols = [c["symbol"] for c in get_candidates(args.index)]
+    df = run_screener(client, index=args.index, ticker_subset=split_into_batches(symbols, NUM_BATCHES)[batch_index])
+    save_partial(df, batch_index, PARTIALS_DIR)
+    if all_batches_complete(PARTIALS_DIR, NUM_BATCHES):
+        return finish_batches(args)
+    print(f"Saved SEC batch {batch_index}; waiting for remaining batches")
+    return False
 
-    if not passing.empty:
-        print(f"\n{'─' * 80}")
-        print(f"  ★ FULL PASS — All 4 quantitative criteria met ({len(passing)} stocks)")
-        print(f"{'─' * 80}")
-        print(tabulate(passing[display_cols], headers="keys", tablefmt="simple",
-                        showindex=False))
-        print("\n  → Review these for committed management and business simplicity")
-        print("    before investing.")
 
-    if not partial.empty:
-        print(f"\n{'─' * 80}")
-        print(f"  PARTIAL PASS — Some criteria met ({len(partial)} stocks)")
-        print(f"{'─' * 80}")
-        print(tabulate(partial[display_cols], headers="keys", tablefmt="simple",
-                        showindex=False))
-
-    print(f"\n{'=' * 80}")
-    print("  NOTE: 'Committed Managers' and 'Simple Business Model' require")
-    print("  qualitative judgment. Research the company before investing.")
-    print("=" * 80 + "\n")
+def finish_batches(args):
+    combined = combine_partials(PARTIALS_DIR, NUM_BATCHES)
+    updated = output_results(combined, args)
+    if updated:
+        clear_partials(PARTIALS_DIR, NUM_BATCHES)
+    return updated
 
 
 def main():
     global MIN_NET_INCOME, MIN_ROE, MIN_INTEREST_COVERAGE
-
-    parser = argparse.ArgumentParser(
-        description="Buffett-Style Stock Screener — powered by FMP API"
-    )
-    parser.add_argument(
-        "--api-key", metavar="KEY",
-        help="FMP API key (or set FMP_API_KEY env var)"
-    )
-    parser.add_argument(
-        "--min-income", type=float, default=MIN_NET_INCOME,
-        help=f"Minimum net income in dollars (default: {MIN_NET_INCOME:,})"
-    )
-    parser.add_argument(
-        "--min-roe", type=float, default=MIN_ROE,
-        help=f"Minimum ROE as decimal (default: {MIN_ROE})"
-    )
-    parser.add_argument(
-        "--min-interest-coverage", type=float, default=MIN_INTEREST_COVERAGE,
-        help=f"Minimum interest coverage ratio (default: {MIN_INTEREST_COVERAGE})"
-    )
-    parser.add_argument(
-        "--max-candidates", type=int, default=200,
-        help="Max stocks to screen per run (default: 200, fits free API tier)"
-    )
-    parser.add_argument(
-        "--index", choices=["sp500", "nasdaq100", "dow"], default="sp500",
-        help="Stock index to screen (default: sp500)"
-    )
-    parser.add_argument(
-        "--csv", metavar="PATH",
-        help="Export results to CSV file"
-    )
-    parser.add_argument(
-        "--pass-only", action="store_true",
-        help="Only include passing stocks (score 4/4) in output and CSV"
-    )
-    parser.add_argument(
-        "--batch", type=int, metavar="N",
-        help="Run batch N (0-4) of the index. Saves partial results to partials/ dir. "
-             "When all 5 batches are done, combines into final results."
-    )
-    parser.add_argument("--next-batch", action="store_true",
-                        help="Resume the next missing batch, independent of the weekday")
+    parser = argparse.ArgumentParser(description="Buffett-style stock screener using free SEC EDGAR data")
+    parser.add_argument("--min-income", type=float, default=MIN_NET_INCOME)
+    parser.add_argument("--min-roe", type=float, default=MIN_ROE)
+    parser.add_argument("--min-interest-coverage", type=float, default=MIN_INTEREST_COVERAGE)
+    parser.add_argument("--max-candidates", type=int, help="Limit stocks for a test run (default: entire bundled index)")
+    parser.add_argument("--index", choices=["sp500", "nasdaq100", "dow"], default="sp500")
+    parser.add_argument("--csv", help="Passing-stock CSV; coverage.csv and report.json are written alongside it")
+    parser.add_argument("--coverage", help="Optional path for the full coverage audit CSV")
+    parser.add_argument("--pass-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--batch", type=int, choices=range(NUM_BATCHES))
+    mode.add_argument("--next-batch", action="store_true")
+    parser.add_argument("--tickers", nargs="+", help="Screen specific symbols instead of an index")
+    parser.add_argument("--file", help="Read one ticker per line")
+    parser.add_argument("--user-agent", help="SEC request identification; defaults to SEC_USER_AGENT or project URL")
     args = parser.parse_args()
-    if args.next_batch and args.batch is not None:
-        parser.error("Use either --next-batch or --batch, not both")
-
-    api_key = args.api_key or os.environ.get("FMP_API_KEY")
-    if not api_key:
-        print("  ERROR: FMP API key required. Use --api-key or set FMP_API_KEY env var.\n")
-        sys.exit(1)
-
-    MIN_NET_INCOME = args.min_income
-    MIN_ROE = args.min_roe
-    MIN_INTEREST_COVERAGE = args.min_interest_coverage
-
-    if args.batch is not None or args.next_batch:
-        updated = run_batch_mode(api_key, args)
-    else:
-        updated = run_full_mode(api_key, args)
+    if args.max_candidates is not None and args.max_candidates < 1:
+        parser.error("--max-candidates must be positive")
+    if args.file:
+        args.tickers = [line.strip() for line in Path(args.file).read_text().splitlines() if line.strip()]
+    if args.tickers and (args.batch is not None or args.next_batch):
+        parser.error("Custom tickers cannot be combined with index batches")
+    if args.tickers:
+        args.tickers = list(dict.fromkeys(t.upper() for t in args.tickers))
+    if args.csv and args.coverage and Path(args.csv).resolve() == Path(args.coverage).resolve():
+        parser.error("Passing results and coverage audit need different file paths")
+    MIN_NET_INCOME, MIN_ROE, MIN_INTEREST_COVERAGE = args.min_income, args.min_roe, args.min_interest_coverage
+    client = SecClient(args.user_agent)
+    updated = run_batch_mode(client, args) if args.batch is not None or args.next_batch else run_full_mode(client, args)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as f:
             f.write(f"results_updated={str(bool(updated)).lower()}\n")
-
-
-def run_full_mode(api_key, args):
-    print(f"\n  Buffett Stock Screener — scanning US market...\n")
-    df = run_screener(api_key, max_candidates=args.max_candidates, index=args.index)
-    return output_results(df, args)
-
-
-def run_batch_mode(api_key, args):
-    batch_index = args.batch
-    if args.next_batch:
-        batch_index = next_missing_batch(PARTIALS_DIR, NUM_BATCHES)
-    if batch_index is None:
-        return finish_batches(args)
-    if not 0 <= batch_index < NUM_BATCHES:
-        print(f"  ERROR: --batch must be 0-{NUM_BATCHES - 1}\n")
-        sys.exit(1)
-
-    all_tickers = get_candidates(index=args.index)
-    all_symbols = [c["symbol"] for c in all_tickers]
-    batches = split_into_batches(all_symbols, NUM_BATCHES)
-    ticker_subset = batches[batch_index]
-
-    print(f"\n  Buffett Stock Screener — batch {batch_index + 1}/{NUM_BATCHES} "
-          f"({len(ticker_subset)} stocks)...\n")
-
-    df = run_screener(api_key, index=args.index, ticker_subset=ticker_subset)
-
-    if df.empty:
-        df = pd.DataFrame(columns=["Ticker", "Company", "Net Income ($M)",
-                                    "Income ≥$75M", "EPS 5yr Growth", "ROE (%)",
-                                    "ROE >10%", "Int. Coverage", "Int.Cov >1",
-                                    "Score", "_score"])
-
-    save_partial(df, batch_index, PARTIALS_DIR)
-    print(f"  Saved batch {batch_index} results to {PARTIALS_DIR}/\n")
-
-    if all_batches_complete(PARTIALS_DIR, NUM_BATCHES):
-        return finish_batches(args)
-    else:
-        done = sum(1 for i in range(NUM_BATCHES)
-                   if os.path.exists(os.path.join(PARTIALS_DIR, f"batch_{i}.csv")))
-        print(f"  Progress: {done}/{NUM_BATCHES} batches complete. "
-              f"Run remaining batches to get final results.\n")
-        return False
-
-
-def finish_batches(args):
-    print("  All batches complete! Combining results...\n")
-    combined = combine_partials(PARTIALS_DIR, NUM_BATCHES)
-    updated = output_results(combined, args)
-    clear_partials(PARTIALS_DIR, NUM_BATCHES)
-    return updated
-
-
-def output_results(df, args):
-    if df.empty:
-        print("  No results found.\n")
-        if len(df.columns) == 0:
-            df = pd.DataFrame(columns=["Ticker", "Company", "Net Income ($M)",
-                                      "Income ≥$75M", "EPS 5yr Growth", "ROE (%)",
-                                      "ROE >10%", "Int. Coverage", "Int.Cov >1", "Score"])
-    elif args.pass_only:
-        df = df[df["_score"] == 4]
-        if df.empty:
-            print("\n  No stocks passed all 4 criteria.\n")
-        else:
-            print_results(df)
-    else:
-        print_results(df)
-
-    if args.csv:
-        export = df[[c for c in df.columns if c != "_score"]]
-        export.to_csv(args.csv, index=False)
-        print(f"  Results exported to {args.csv}\n")
-        return True
-    return False
 
 
 if __name__ == "__main__":
