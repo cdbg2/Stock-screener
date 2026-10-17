@@ -14,7 +14,7 @@ import time
 import requests
 
 ANNUAL_FORMS = {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"}
-DEFAULT_USER_AGENT = "ChasDeistStockScreener/2.0 (https://github.com/cdbg2/Stock-screener)"
+DEFAULT_USER_AGENT = "ChasDeistStockScreener/2.0 cdbg2 30451555+cdbg2@users.noreply.github.com (https://github.com/cdbg2/Stock-screener)"
 INCOME_TAGS = ("NetIncomeLoss",)
 INTEREST_TAGS = ("InterestExpense", "InterestAndDebtExpense", "InterestExpenseNonoperating")
 

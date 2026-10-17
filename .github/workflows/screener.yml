@@ -50,7 +50,7 @@ jobs:
       - name: Run SEC screener
         id: screen
         env:
-          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || 'ChasDeistStockScreener/2.0 (https://github.com/cdbg2/Stock-screener)' }}
+          SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || 'ChasDeistStockScreener/2.0 cdbg2 30451555+cdbg2@users.noreply.github.com (https://github.com/cdbg2/Stock-screener)' }}
           BATCH_INPUT: ${{ github.event.inputs.batch }}
           EVENT_NAME: ${{ github.event_name }}
           FULL_SCAN: ${{ github.event.inputs.full_scan }}
