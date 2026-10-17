@@ -5,4 +5,5 @@ __pycache__/
 !results.csv
 !coverage.csv
 !partials/*.csv
+!partials/sec-v1/*.csv
 .cache/

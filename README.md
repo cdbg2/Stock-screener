@@ -2,6 +2,8 @@
 
 Free, repeatable screening of the bundled S&P 500, NASDAQ 100, or Dow stock lists using annual financial facts from SEC EDGAR. No FMP account, subscription, or API key is needed.
 
+**Hosting status (October 17, 2026):** SEC downloads work from the development environment, but SEC returned HTTP 403 to GitHub-hosted runners, including with a declared contact header. Automatic network scans are paused to avoid repeated failures. Regression tests continue to run in GitHub; passing tests alone do not mean a report was refreshed. See `report.json` for the last successful report time. A runner with working SEC access is needed before re-enabling automatic scans.
+
 ## Criteria
 
 | Criterion | Test |
@@ -54,7 +56,7 @@ These conservative rules trade some coverage for traceable calculations. The fix
 
 The GitHub Actions workflow runs weekdays at 21:00 UTC (5 PM Eastern during daylight saving time, 4 PM during standard time). Each scheduled run resumes the next missing batch, independent of the weekday on which the runner actually starts. Five completed batches produce a full report and clear the partials for the next cycle. Runs are serialized.
 
-Code changes on `main` trigger a full rebuild, so source changes take effect immediately. In **Actions → Buffett Stock Screener → Run workflow**, leave inputs empty to resume a batch, enter a batch number 0–4 to rerun one, or select **full_scan** to rebuild the entire index now. Full scans take precedence over the batch input and discard the previous SEC batch cycle only after successfully writing their reports.
+When network scans are enabled, code changes on `main` trigger a full rebuild, so source changes take effect immediately. In **Actions → Buffett Stock Screener → Run workflow**, leave inputs empty to resume a batch, enter a batch number 0–4 to rerun one, or select **full_scan** to rebuild the entire index now. Full scans take precedence over the batch input and discard the previous SEC batch cycle only after successfully writing their reports.
 
 SEC batch files live in `partials/sec-v1/`, separate from legacy FMP partials. To resume locally:
 
@@ -63,3 +65,5 @@ python screener.py --next-batch --pass-only --csv results.csv
 ```
 
 FMP secrets are no longer read or required. An optional repository variable `SEC_USER_AGENT` overrides the default project identification.
+
+To re-enable GitHub scans after configuring a runner with SEC access, set repository variable `SEC_RUNNER` to its runner label (for example `self-hosted`), and set `SEC_NETWORK_ENABLED` to `true`. The default runner is `ubuntu-latest`. Manual dispatch still attempts a network scan so access can be tested; a 403 stops immediately and preserves published reports.

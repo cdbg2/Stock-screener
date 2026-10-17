@@ -32,8 +32,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  screen:
+  validate:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run regression tests
+        run: python -m pytest -q
+
+  screen:
+    needs: validate
+    # The hosted runner was denied by SEC (HTTP 403). Do not generate daily
+    # failure notifications until a runner with SEC access has been configured.
+    if: github.event_name == 'workflow_dispatch' || vars.SEC_NETWORK_ENABLED == 'true'
+    runs-on: ${{ vars.SEC_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,9 +59,6 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Run regression tests
-        run: python -m pytest -q
 
       - name: Run SEC screener
         id: screen
