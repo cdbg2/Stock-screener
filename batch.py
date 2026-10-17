@@ -40,6 +40,12 @@ def all_batches_complete(output_dir, num_batches):
     )
 
 
+def next_missing_batch(output_dir, num_batches):
+    """Resume saved progress regardless of the runner's calendar day."""
+    return next((i for i in range(num_batches)
+                 if not os.path.exists(_partial_path(i, output_dir))), None)
+
+
 def combine_partials(output_dir, num_batches):
     frames = []
     for i in range(num_batches):

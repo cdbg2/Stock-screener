@@ -1,16 +1,26 @@
 name: Buffett Stock Screener
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - screener.py
+      - batch.py
+      - .github/workflows/screener.yml
   schedule:
     - cron: "0 21 * * 1-5"  # Mon-Fri at 9 PM UTC (5 PM Eastern, after market close)
   workflow_dispatch:
     inputs:
       batch:
-        description: "Batch number (0-4), or leave empty for auto (weekday-based)"
+        description: "Batch number (0-4), or leave empty to resume the next missing batch"
         required: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: stock-screener-results
+  cancel-in-progress: false
 
 jobs:
   screen:
@@ -25,30 +35,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Determine batch number
-        id: batch
-        run: |
-          if [ -n "${{ github.event.inputs.batch }}" ]; then
-            echo "num=${{ github.event.inputs.batch }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "num=$(( $(date -u +%u) - 1 ))" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Run regression tests
+        run: python -m pytest -q
 
-      - name: Run screener (batch ${{ steps.batch.outputs.num }})
+      - name: Run next missing batch
+        id: screen
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-        run: python screener.py --batch ${{ steps.batch.outputs.num }} --pass-only --csv results.csv
+          BATCH_INPUT: ${{ github.event.inputs.batch }}
+        run: |
+          if [ -n "$BATCH_INPUT" ]; then
+            python screener.py --batch "$BATCH_INPUT" --pass-only --csv results.csv
+          else
+            python screener.py --next-batch --pass-only --csv results.csv
+          fi
         timeout-minutes: 10
 
       - name: Upload batch results
+        if: hashFiles('partials/*.csv') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: screener-batch-${{ steps.batch.outputs.num }}
+          name: screener-partials
           path: partials/
           retention-days: 30
 
       - name: Upload final results
-        if: hashFiles('results.csv') != ''
+        if: steps.screen.outputs.results_updated == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: screener-results
@@ -61,5 +73,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f partials/
           git add -f results.csv 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "Screener batch ${{ steps.batch.outputs.num }} $(date -u +%Y-%m-%d)"
+          git diff --cached --quiet || git commit -m "Update screener progress $(date -u +%Y-%m-%d)"
           git push

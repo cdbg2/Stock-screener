@@ -24,12 +24,13 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 
 import pandas as pd
 import requests
 from tabulate import tabulate
 
-from batch import split_into_batches, save_partial, all_batches_complete, combine_partials, clear_partials
+from batch import split_into_batches, save_partial, all_batches_complete, combine_partials, clear_partials, next_missing_batch
 from constituents import SP500, NASDAQ100, DOW30
 
 NUM_BATCHES = 5
@@ -52,7 +53,34 @@ def fmp_get(endpoint, api_key, params=None):
         p.update(params)
     resp = requests.get(url, params=p, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    if not isinstance(data, list):
+        # Do not print provider responses or request URLs: they can contain the API key.
+        raise ValueError("Unexpected provider response")
+    return data
+
+
+def report_fetch_errors(phase, attempted, errors):
+    """Expose incomplete coverage without leaking request URLs or credentials."""
+    if not errors:
+        return
+    counts = Counter(errors.values())
+    detail = ", ".join(f"{reason}: {count}" for reason, count in sorted(counts.items()))
+    message = (f"{phase}: data unavailable for {len(errors)}/{attempted} stocks "
+               f"({detail}). These stocks could not be fully evaluated.")
+    print(f"  WARNING: {message}")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{message}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(f"\n- {message}\n  Affected tickers: {', '.join(sorted(errors))}\n")
+
+
+def error_category(error):
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        return f"HTTP {error.response.status_code}"
+    return type(error).__name__
 
 
 def get_candidates(index="sp500"):
@@ -130,6 +158,7 @@ def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None
     # ── Phase 2: Income statements — check 3 of 4 criteria (N calls) ────
     print("  Phase 2: Checking income, EPS growth & interest coverage...")
     phase2_pass = []
+    income_errors = {}
     done = 0
 
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -142,9 +171,11 @@ def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None
             done += 1
             c = futures[f]
             print(f"           [{done}/{len(candidates)}] {c['symbol']}", end="\r")
+            api_calls += 1
             try:
                 statements = f.result()
-                api_calls += 1
+                if not statements:
+                    raise ValueError("No income statements")
                 net_income, eps_list, eps_growing, int_cov = check_income_criteria(statements)
 
                 pass_income = net_income is not None and net_income >= MIN_NET_INCOME
@@ -162,8 +193,12 @@ def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None
                     "pass_eps": eps_growing is True,
                     "pass_int_cov": int_cov is not None and int_cov > MIN_INTEREST_COVERAGE,
                 })
-            except Exception:
-                api_calls += 1
+            except Exception as error:
+                income_errors[c["symbol"]] = error_category(error)
+
+    report_fetch_errors("Income statements", len(candidates), income_errors)
+    if candidates and len(income_errors) == len(candidates):
+        raise RuntimeError("No income data could be retrieved; batch was not saved.")
 
     print(f"           {len(phase2_pass)} stocks pass ${MIN_NET_INCOME / 1e6:.0f}M income threshold{' ' * 20}\n")
 
@@ -173,6 +208,7 @@ def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None
     # ── Phase 3: Balance sheets — ROE check for survivors only (M calls) ─
     print(f"  Phase 3: Checking ROE for {len(phase2_pass)} candidates...")
     done = 0
+    balance_errors = {}
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {}
@@ -184,16 +220,22 @@ def run_screener(api_key, max_candidates=None, index="sp500", ticker_subset=None
             done += 1
             r = futures[f]
             print(f"           [{done}/{len(phase2_pass)}] {r['symbol']}", end="\r")
+            api_calls += 1
             try:
                 bs = f.result()
-                api_calls += 1
+                if not bs:
+                    raise ValueError("No balance sheet")
                 roe = compute_roe(r["net_income"], bs)
                 r["roe"] = roe
                 r["pass_roe"] = roe is not None and roe >= MIN_ROE
-            except Exception:
-                api_calls += 1
+            except Exception as error:
                 r["roe"] = None
                 r["pass_roe"] = False
+                balance_errors[r["symbol"]] = error_category(error)
+
+    report_fetch_errors("Balance sheets", len(phase2_pass), balance_errors)
+    if len(balance_errors) == len(phase2_pass):
+        raise RuntimeError("No balance sheets could be retrieved; batch was not saved.")
 
     elapsed = time.time() - t0
     print(f"           Done. ({api_calls} API calls, {elapsed:.1f}s){' ' * 20}\n")
@@ -304,7 +346,11 @@ def main():
         help="Run batch N (0-4) of the index. Saves partial results to partials/ dir. "
              "When all 5 batches are done, combines into final results."
     )
+    parser.add_argument("--next-batch", action="store_true",
+                        help="Resume the next missing batch, independent of the weekday")
     args = parser.parse_args()
+    if args.next_batch and args.batch is not None:
+        parser.error("Use either --next-batch or --batch, not both")
 
     api_key = args.api_key or os.environ.get("FMP_API_KEY")
     if not api_key:
@@ -315,20 +361,27 @@ def main():
     MIN_ROE = args.min_roe
     MIN_INTEREST_COVERAGE = args.min_interest_coverage
 
-    if args.batch is not None:
-        run_batch_mode(api_key, args)
+    if args.batch is not None or args.next_batch:
+        updated = run_batch_mode(api_key, args)
     else:
-        run_full_mode(api_key, args)
+        updated = run_full_mode(api_key, args)
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"results_updated={str(bool(updated)).lower()}\n")
 
 
 def run_full_mode(api_key, args):
     print(f"\n  Buffett Stock Screener — scanning US market...\n")
     df = run_screener(api_key, max_candidates=args.max_candidates, index=args.index)
-    output_results(df, args)
+    return output_results(df, args)
 
 
 def run_batch_mode(api_key, args):
     batch_index = args.batch
+    if args.next_batch:
+        batch_index = next_missing_batch(PARTIALS_DIR, NUM_BATCHES)
+    if batch_index is None:
+        return finish_batches(args)
     if not 0 <= batch_index < NUM_BATCHES:
         print(f"  ERROR: --batch must be 0-{NUM_BATCHES - 1}\n")
         sys.exit(1)
@@ -353,23 +406,31 @@ def run_batch_mode(api_key, args):
     print(f"  Saved batch {batch_index} results to {PARTIALS_DIR}/\n")
 
     if all_batches_complete(PARTIALS_DIR, NUM_BATCHES):
-        print("  All batches complete! Combining results...\n")
-        combined = combine_partials(PARTIALS_DIR, NUM_BATCHES)
-        output_results(combined, args)
-        clear_partials(PARTIALS_DIR, NUM_BATCHES)
+        return finish_batches(args)
     else:
         done = sum(1 for i in range(NUM_BATCHES)
                    if os.path.exists(os.path.join(PARTIALS_DIR, f"batch_{i}.csv")))
         print(f"  Progress: {done}/{NUM_BATCHES} batches complete. "
               f"Run remaining batches to get final results.\n")
+        return False
+
+
+def finish_batches(args):
+    print("  All batches complete! Combining results...\n")
+    combined = combine_partials(PARTIALS_DIR, NUM_BATCHES)
+    updated = output_results(combined, args)
+    clear_partials(PARTIALS_DIR, NUM_BATCHES)
+    return updated
 
 
 def output_results(df, args):
     if df.empty:
         print("  No results found.\n")
-        return
-
-    if args.pass_only:
+        if len(df.columns) == 0:
+            df = pd.DataFrame(columns=["Ticker", "Company", "Net Income ($M)",
+                                      "Income ≥$75M", "EPS 5yr Growth", "ROE (%)",
+                                      "ROE >10%", "Int. Coverage", "Int.Cov >1", "Score"])
+    elif args.pass_only:
         df = df[df["_score"] == 4]
         if df.empty:
             print("\n  No stocks passed all 4 criteria.\n")
@@ -378,10 +439,12 @@ def output_results(df, args):
     else:
         print_results(df)
 
-    if args.csv and not df.empty:
+    if args.csv:
         export = df[[c for c in df.columns if c != "_score"]]
         export.to_csv(args.csv, index=False)
         print(f"  Results exported to {args.csv}\n")
+        return True
+    return False
 
 
 if __name__ == "__main__":
