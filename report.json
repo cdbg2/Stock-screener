@@ -1,0 +1,15 @@
+{
+  "source": "SEC EDGAR Company Facts + submissions",
+  "schema": "sec-v1",
+  "generated_at_utc": "2026-10-17T05:58:16+00:00",
+  "attempted": 496,
+  "pass": 24,
+  "fail": 174,
+  "not_evaluated": 298,
+  "eps_growth_years": 5,
+  "eps_annual_observations": 6,
+  "min_net_income_usd": 75000000,
+  "min_roe_exclusive": 0.1,
+  "min_interest_coverage_exclusive": 1.0,
+  "universe": "sp500"
+}
