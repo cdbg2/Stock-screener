@@ -161,11 +161,17 @@ def test_share_class_alias_and_issuer_requests_are_reused(tmp_path,monkeypatch):
     client=SecClient(cache_dir=tmp_path);f,s=payload();calls=[]
     def get(url,key):
         calls.append(key)
-        if key=="tickers":return {"0":{"ticker":"BRK-B","cik_str":1067983}}
         return f if key.startswith("facts-") else s
     monkeypatch.setattr(client,"get_json",get)
     assert client.financials("BRK.B") is client.financials("BRK-B")
-    assert len(calls)==3
+    assert len(calls)==2
+
+
+def test_bundled_ticker_directory_requires_no_network(tmp_path,monkeypatch):
+    client=SecClient(cache_dir=tmp_path)
+    monkeypatch.setattr(client,"get_json",lambda *a:pytest.fail("Ticker lookup should be offline"))
+    assert client.load_tickers()["MSFT"]["cik_str"]==789019
+    assert client.load_tickers()["BRK-B"]["cik_str"]==1067983
 
 
 def test_stock_split_with_unrestated_old_eps_is_not_compared():

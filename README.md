@@ -39,7 +39,7 @@ Reports are committed to the repository and attached as a `screener-results` art
 
 ## Data handling and limits
 
-Data comes from the SEC's [Company Facts and submissions APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces), with tickers mapped through the [SEC ticker file](https://www.sec.gov/files/company_tickers.json).
+Data comes from the SEC's [Company Facts and submissions APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces), with tickers mapped through a bundled snapshot of the [SEC ticker file](https://www.sec.gov/files/company_tickers.json), dated in `sec_tickers.json`. This avoids downloading the directory from `www.sec.gov`, which can block hosted runners even when the financial APIs are accessible. Refresh the snapshot when ticker/CIK associations change; unmapped symbols are marked not evaluated. The snapshot retains all ticker/CIK pairs from the official directory.
 
 - Identify the latest annual filing in SEC submissions. Select full-year (330–380 day) observations from annual filings, not quarterly or trailing periods. Use actual start/end dates; the XBRL `fy` field can describe the filing rather than a comparative fact's year.
 - Match income, operating income, interest expense, and closing equity to the same fiscal period. Prefer the latest filed/restated fact within a supported tag. Keep all six EPS observations on one definition (diluted when available, otherwise basic). Reject gaps or incompatible stock-split histories rather than guessing an adjustment.

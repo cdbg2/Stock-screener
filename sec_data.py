@@ -211,8 +211,12 @@ class SecClient:
 
     def load_tickers(self):
         if self.tickers is None:
-            data = self.get_json("https://www.sec.gov/files/company_tickers.json", "tickers")
-            self.tickers = {r["ticker"].upper().replace(".", "-"): r for r in data.values()}
+            # www.sec.gov's directory download can reject hosted runners even
+            # when data.sec.gov's financial APIs are accessible. Use an official
+            # directory snapshot; do not disguise requests or hammer blocked IPs.
+            snapshot = json.loads(Path(__file__).with_name("sec_tickers.json").read_text())
+            self.tickers = {ticker.upper().replace(".", "-"): {"cik_str": cik}
+                            for ticker, cik in snapshot["tickers"].items()}
         return self.tickers
 
     def financials(self, symbol):
